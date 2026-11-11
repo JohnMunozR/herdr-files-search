@@ -1,0 +1,6 @@
+{
+  "global": {
+    "ctrl-p": "mod.open:files-search",
+    "alt-f": "mod.open:files-search"
+  }
+}

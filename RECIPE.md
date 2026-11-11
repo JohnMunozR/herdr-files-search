@@ -45,6 +45,7 @@ An enhanced file browser and IntelliJ-style Search Everywhere mod for the Herdr 
 ## Built from
 
 - **Layout integration**: Replaces `{ "mod": "files" }` with `{ "mod": "files-search" }` in layouts (e.g., `main-copy.json`).
+- **Keys integration**: Merges `"ctrl-p": "mod.open:files-search"` and `"alt-f": "mod.open:files-search"` into `keys.json` under `"global"`.
 - **Mod files**:
   - `mods/files-search/main.js`: Dual-mode component (`Files` panel + `Search Everywhere` floating dialog).
   - `mods/files-search/mod.json`: Manifest declaring `files-search` as a clone of `files`.

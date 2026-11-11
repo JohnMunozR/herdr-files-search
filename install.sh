@@ -49,6 +49,32 @@ if [ -d "${LAYOUTS_DIR}" ]; then
   done
 fi
 
+echo "--> Configuring global shortcuts in keys.json..."
+KEYS_FILE="${HERDR_DIR}/keys.json"
+python3 -c "
+import json, os
+
+keys_path = os.path.expanduser('${KEYS_FILE}')
+if os.path.exists(keys_path):
+    try:
+        keys = json.load(open(keys_path))
+    except Exception:
+        keys = {}
+else:
+    keys = {}
+
+if 'global' not in keys:
+    keys['global'] = {}
+
+# Add files-search shortcuts if not already mapped
+keys['global'].setdefault('ctrl-p', 'mod.open:files-search')
+keys['global'].setdefault('alt-f', 'mod.open:files-search')
+
+with open(keys_path, 'w') as f:
+    json.dump(keys, f, indent=2)
+print('    Registered Ctrl+P and Alt+F for Search Everywhere in keys.json')
+"
+
 echo ""
 echo "=== Installation completed successfully! ==="
 echo "The 'files-search' mod is now installed in ${MOD_DIR}."
