@@ -2,24 +2,33 @@
 
 An enhanced file browser and IntelliJ-style **Search Everywhere** mod for the [Herdr](https://github.com/herdr-app) desktop app.
 
-It extends Herdr's native `files` panel with a magnifying glass search icon in the header that launches a floating search dialog supporting multi-tab searches across files and file contents (`All`, `Files`, `Text`), fuzzy filename matching, fast live grep search, keyboard navigation, and automatic file preview with parent directory expansion.
+It extends Herdr's native `files` panel with a magnifying glass search icon in the header that launches a floating search dialog supporting multi-tab searches across files and file contents (`All`, `Files`, `Text`), fuzzy filename matching, fast live grep search, keyboard navigation, a live code preview panel, draggable title bar, and smooth resizing.
 
 ![files-search](preview.png)
 
 ## Features
 
-- **Files Panel Integration**: Preserves the complete native file tree, lazy folder loading, git status badges (`A`, `M`, `D`, `U`), and syntax-highlighted code preview.
-- **Search Everywhere Overlay**: 
+- **Files Panel Integration**: Preserves the complete native file tree, lazy folder loading, deep repository indexing without artificial depth limits, git status badges (`A`, `M`, `D`, `U`), and syntax-highlighted code preview.
+- **Search Everywhere Floating Window**: 
   - Floating dialog styled after IntelliJ's Search Everywhere window.
   - **`All`**: Unified search showing top file name matches and code content matches in one view.
   - **`Files`**: High-performance fuzzy search across all workspace files by name and relative path.
   - **`Text`**: Fast full-text grep search (`rg` / `git grep`) across repository contents with line numbers and highlighted code snippets.
-- **Keyboard & Mouse Navigation**:
-  - `Tab` / `Shift+Tab`: Cycle between `All`, `Files`, and `Text` tabs without leaving the keyboard.
-  - `↑` / `↓` / `PageUp` / `PageDown`: Navigate search results with fixed-position virtual scrolling.
-  - `Enter` / Click: Jump directly to the selected file, close the search window, expand its parent folders in the file tree, and open the code preview.
-  - `Esc`: Close the search overlay.
-- **Theme Adaptive**: Dynamically inherits theme colors (`popover`, `accent`, `raised`, `selected`, `dim`, `foreground`) from the active Herdr theme.
+- **IntelliJ-Style Code Preview**:
+  - Live split preview pane toggled with `[ ◨ Preview ]` or `Alt+P` / `Ctrl+P`.
+  - Shows line numbers, target line highlighting, and query matches.
+- **Movable & Resizable**:
+  - **Draggable**: Click and drag anywhere on the header to move the window.
+  - **Resizable**: Drag the corner grip `⋰` smoothly in any direction (protected against fast mouse sweeps).
+  - **Discrete Size Controls**: Bottom-right status pill with `[-]`, `[+]`, `[ ▢ ]` (maximize/restore), and keyboard shortcuts (`Ctrl+=`, `Ctrl+-`, `Ctrl+0`).
+- **Keyboard Shortcuts**:
+  - `Shift + Shift`: Double-Shift inside the Files panel opens Search Everywhere.
+  - `Ctrl + P` / `Alt + F`: Open Search Everywhere from anywhere in Herdr.
+  - `Tab` / `Shift+Tab`: Cycle between `All`, `Files`, and `Text` tabs.
+  - `↑` / `↓` / `PageUp` / `PageDown`: Navigate search results.
+  - `Enter` / Click: Jump directly to the file, expand parent directories in the tree, and open preview.
+  - `Esc`: Close the dialog.
+- **Theme Adaptive**: Dynamically inherits theme colors (`popover`, `accent`, `raised`, `selected`, `dim`, `foreground`, `border`) from the active Herdr theme.
 
 ## Quick Install
 
@@ -37,28 +46,52 @@ cd herdr-files-search
 bash install.sh
 ```
 
-The script copies the mod into `~/.config/herdr-app/mods/files-search/`, verifies its syntax with `herdr-app check`, and updates your Herdr layouts (`main-copy.json`, etc.) to use `files-search` instead of `files`.
+The installer conforms to Herdr's mod documentation:
+1. Copies the mod to `~/.config/herdr-app/mods/files-search/`.
+2. Validates syntax with `herdr-app check`.
+3. Adheres to Herdr layout immutability: respects shipped layouts (`main`, `terminals`, `win98`) and creates or updates your personal layout clone (e.g. `main-copy.json`).
+4. Merges `Ctrl+P` and `Alt+F` into `~/.config/herdr-app/keys.json` without overwriting existing shortcuts.
+5. Switches Herdr live to the updated layout.
 
 ## Manual Installation
 
-1. Copy the mod folder:
+Following Herdr's mod guide (`AGENTS.md`):
+
+1. **Copy the mod folder**:
    ```bash
    mkdir -p ~/.config/herdr-app/mods/files-search
    cp -r mods/files-search/* ~/.config/herdr-app/mods/files-search/
    ```
 
-2. Update your personal layout file in `~/.config/herdr-app/layouts/` (e.g. `main-copy.json`):
+2. **Verify syntax**:
+   ```bash
+   herdr-app check ~/.config/herdr-app/mods/files-search
+   ```
+
+3. **Clone and update layout** (never edit shipped `main.json` directly):
+   ```bash
+   herdr-app do layout.clone '{"name":"main","as":"main-copy"}'
+   ```
+   In `~/.config/herdr-app/layouts/main-copy.json`, replace `"mod": "files"` with `"mod": "files-search"`.
+
+4. **Register shortcuts in `~/.config/herdr-app/keys.json`**:
    ```json
    {
-     "id": "files",
-     "type": "block",
-     "content": {
-       "mod": "files-search"
+     "global": {
+       "ctrl-p": "mod.open:files-search",
+       "alt-f": "mod.open:files-search"
      }
    }
    ```
 
-3. Reload Herdr or switch layouts to see the new search button on the **Files** tab.
+5. **Switch layout in Herdr**:
+   ```bash
+   herdr-app do layout.switch '{"name":"main-copy"}'
+   ```
+
+## Specification & Recipes
+
+See [RECIPE.md](RECIPE.md) for the complete design specification, behavior rules, and Herdr mod architecture guidelines.
 
 ## License
 
