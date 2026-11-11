@@ -460,16 +460,42 @@ export default class FilesSearch extends View {
 
   adjustWindowSize(deltaW, deltaH, cx) {
     const defaultW = this.showPreview ? 1050 : 680;
-    const minW = this.showPreview ? 920 : 600;
-    const minH = 200;
-    const maxW = 1800;
-    const maxH = 850;
+    const minW = this.showPreview ? 860 : 540;
+    const minH = 220;
+    const maxW = 1900;
+    const maxH = 900;
 
     const currentW = this.customWidth || defaultW;
     const currentH = this.customListHeight || LIST_H;
 
     this.customWidth = Math.max(minW, Math.min(maxW, currentW + deltaW));
     this.customListHeight = Math.max(minH, Math.min(maxH, currentH + deltaH));
+    setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
+    cx.notify();
+  }
+
+  startResize(e, defaultW, cx) {
+    this.resizing = true;
+    this.resizeStartX = e.position.x;
+    this.resizeStartY = e.position.y;
+    this.resizeStartW = this.customWidth || defaultW;
+    this.resizeStartH = this.customListHeight || LIST_H;
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  handleResizeMove(e, minW, maxW, minH, maxH, cx) {
+    if (!this.resizing) return;
+    const totalDx = e.position.x - this.resizeStartX;
+    const totalDy = e.position.y - this.resizeStartY;
+    this.customWidth = Math.max(minW, Math.min(maxW, Math.round(this.resizeStartW + totalDx)));
+    this.customListHeight = Math.max(minH, Math.min(maxH, Math.round(this.resizeStartH + totalDy)));
+    cx.notify();
+  }
+
+  handleResizeEnd(cx) {
+    if (!this.resizing) return;
+    this.resizing = false;
     setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
     cx.notify();
   }
@@ -965,10 +991,10 @@ export default class FilesSearch extends View {
 
     // Dynamic width & height calculation with minimum and maximum bounds
     const defaultW = this.showPreview ? 1050 : 680;
-    const minW = this.showPreview ? 920 : 600;
-    const minH = 200;
-    const maxW = 1800;
-    const maxH = 850;
+    const minW = this.showPreview ? 860 : 540;
+    const minH = 220;
+    const maxW = 1900;
+    const maxH = 900;
 
     let winW = this.customWidth || defaultW;
     winW = Math.max(minW, Math.min(maxW, winW));
@@ -1053,34 +1079,38 @@ export default class FilesSearch extends View {
       );
     });
 
-    return v_flex()
-      .id("files-search-overlay")
-      .track_focus(this.handle)
+    return div()
+      .id("files-search-overlay-root")
       .relative()
-      .w(winW)
-      .min_h(0)
-      .p(18)
-      .gap(10)
-      .rounded(10)
-      .border_1()
-      .border_color(t.border)
-      .bg(t.popover)
-      .shadow_lg()
-      // Global mouse release handlers
-      .on_mouse_up("left", (_e, cx) => {
-        if (this.resizing) {
-          this.resizing = false;
-          setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
-          cx.notify();
-        }
-      })
+      // Generous invisible tracking buffer that activates during dragging so fast swipes never escape
+      .when(Boolean(this.resizing), el =>
+        el.pr(400)
+          .pb(400)
+          .cursor_nwse_resize()
+          .on_mouse_move((e, cx) => this.handleResizeMove(e, minW, maxW, minH, maxH, cx))
+          .on_mouse_up("left", (_e, cx) => this.handleResizeEnd(cx))
+      )
       .on_mouse_down_out((_e, cx) => {
         if (this.resizing) {
-          this.resizing = false;
-          cx.notify();
+          this.handleResizeEnd(cx);
         }
       })
-      .on_key_down((e, cx) => {
+      .child(
+        v_flex()
+          .id("files-search-overlay")
+          .track_focus(this.handle)
+          .relative()
+          .w(winW)
+          .min_h(0)
+          .p(18)
+          .gap(10)
+          .rounded(10)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.popover)
+          .shadow_lg()
+          .on_mouse_up("left", (_e, cx) => this.handleResizeEnd(cx))
+          .on_key_down((e, cx) => {
         const k = e.key;
         if (k === "escape") return this.closeOverlay();
         if (k === "tab") {
@@ -1382,58 +1412,35 @@ export default class FilesSearch extends View {
           .child(
             div()
               .id("resize-corner-grip")
-              .size(16)
+              .size(18)
               .rounded(3)
               .cursor_nwse_resize()
               .flex()
               .items_center()
               .justify_center()
-              .text_color(t.dim)
+              .text_color(this.resizing ? t.accent : t.dim)
               .hover(s => s.text_color(t.foreground))
-              .on_mouse_down("left", (e, cx) => {
-                this.resizing = true;
-                this.lastMouseX = e.position.x;
-                this.lastMouseY = e.position.y;
-                cx.stop_propagation();
-                cx.notify();
-              })
-              .child(svg("mods/files-search/grip.svg").size(9))
+              .on_mouse_down("left", (e, cx) => this.startResize(e, defaultW, cx))
+              .child(svg("mods/files-search/grip.svg").size(10))
           )
       )
-      // Active Drag Shield: covers overlay and extends 400px outside so fast mouse movements
-      // never lose mouse tracking or get intercepted by child controls
+      // When actively resizing, cover the entire card so moving fast over preview/input/rows
+      // never loses the nwse-resize cursor, never triggers child hover states, and never breaks dragging
       .when(Boolean(this.resizing), el =>
         el.child(
           div()
-            .id("resize-drag-shield")
+            .id("resize-card-cover")
             .absolute()
-            .left(-400)
-            .top(-400)
-            .right(-400)
-            .bottom(-400)
+            .top(0)
+            .left(0)
+            .size_full()
             .cursor_nwse_resize()
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-            .on_mouse_move((e, cx) => {
-              if (!this.resizing) return;
-              const dx = e.position.x - this.lastMouseX;
-              const dy = e.position.y - this.lastMouseY;
-              this.lastMouseX = e.position.x;
-              this.lastMouseY = e.position.y;
-
-              const nextW = (this.customWidth || defaultW) + dx * 2;
-              const nextH = (this.customListHeight || LIST_H) + dy;
-
-              this.customWidth = Math.max(minW, Math.min(maxW, nextW));
-              this.customListHeight = Math.max(minH, Math.min(maxH, nextH));
-              cx.notify();
-            })
-            .on_mouse_up("left", (_e, cx) => {
-              this.resizing = false;
-              setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
-              cx.notify();
-            })
+            .on_mouse_move((e, cx) => this.handleResizeMove(e, minW, maxW, minH, maxH, cx))
+            .on_mouse_up("left", (_e, cx) => this.handleResizeEnd(cx))
         )
-      );
+      )
+    );
   }
 
   render(cx) {
