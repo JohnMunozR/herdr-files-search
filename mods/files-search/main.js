@@ -422,6 +422,16 @@ export default class FilesSearch extends View {
     this.previewScroll = 0;
     this.previewCache = new Map();
 
+    // Resize state (remembers user size preference)
+    const savedSize = shared("files-search.customSize");
+    this.customWidth = savedSize?.w || null;
+    this.customListHeight = savedSize?.h || null;
+    this.resizing = null;
+    this.dragStartX = 0;
+    this.dragStartY = 0;
+    this.startWidth = 0;
+    this.startListHeight = 0;
+
     this.input = InputState.new({ placeholder: "Search everywhere by name or text (Tab to switch)..." });
     this.input.on("change", (_e, cx) => {
       this.query = this.input.value();
@@ -763,11 +773,11 @@ export default class FilesSearch extends View {
       .child(div().child(after.replace(/ /g, "\u00a0")));
   }
 
-  renderPreviewPane(t, item, cx) {
+  renderPreviewPane(t, item, cx, listH = LIST_H, previewW = 520) {
     if (!item) {
       return v_flex()
-        .w(520)
-        .h(LIST_H + 46)
+        .w(previewW)
+        .h(listH + 46)
         .rounded(8)
         .border_1()
         .border_color(t.border)
@@ -782,8 +792,8 @@ export default class FilesSearch extends View {
     const fileName = item.path.split("/").pop() || item.path;
     const dirPath = item.path.includes("/") ? item.path.slice(0, item.path.lastIndexOf("/")) : "";
 
-    const VISIBLE_ROWS = 15;
     const LINE_H = 21;
+    const VISIBLE_ROWS = Math.max(5, Math.floor((listH + 12) / LINE_H));
     const maxScroll = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
     this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxScroll));
 
@@ -803,6 +813,9 @@ export default class FilesSearch extends View {
           .items_center()
           .px(4)
           .gap(8)
+          .cursor_pointer()
+          .hover(s => s.bg(t.hover))
+          .on_click(() => this.selectResult({ ...item, line: lineNum }, cx))
           .when(isTarget, el => el.bg(t.selected).border_l(3).border_color(t.accent))
           .when(!isTarget, el => el.border_l(3).border_color(t.background))
           // Line Number Gutter
@@ -837,8 +850,8 @@ export default class FilesSearch extends View {
     }
 
     return v_flex()
-      .w(520)
-      .h(LIST_H + 46)
+      .w(previewW)
+      .h(listH + 46)
       .flex_none()
       .rounded(8)
       .border_1()
@@ -936,21 +949,45 @@ export default class FilesSearch extends View {
       }
     }
 
+    // Dynamic width & height calculation with minimum and maximum bounds
+    const defaultW = this.showPreview ? 1050 : 680;
+    const minW = this.showPreview ? 920 : 600;
+    const minH = 200;
+    const maxW = 1800;
+    const maxH = 850;
+
+    let winW = this.customWidth || defaultW;
+    winW = Math.max(minW, Math.min(maxW, winW));
+
+    let listH = this.customListHeight || LIST_H;
+    listH = Math.max(minH, Math.min(maxH, listH));
+
+    const availableContentW = winW - 36;
+    let leftW = 644;
+    let previewW = 520;
+    if (this.showPreview) {
+      const remainingW = availableContentW - 12;
+      leftW = Math.max(400, Math.min(620, Math.round(remainingW * 0.44)));
+      previewW = Math.max(480, remainingW - leftW);
+    } else {
+      leftW = availableContentW;
+    }
+
     const total = results.length * ROW_H;
-    const fixed = total > LIST_H;
-    this.maxScroll = Math.max(0, total - LIST_H);
+    const fixed = total > listH;
+    this.maxScroll = Math.max(0, total - listH);
 
     const selRow = this.at * ROW_H;
     if (selRow < this.scroll) this.scroll = selRow;
-    if (selRow + ROW_H > this.scroll + LIST_H) this.scroll = selRow + ROW_H - LIST_H;
+    if (selRow + ROW_H > this.scroll + listH) this.scroll = selRow + ROW_H - listH;
     this.scroll = Math.max(0, Math.min(this.scroll, this.maxScroll));
 
     const place = (el, start, end) =>
       fixed
-        ? el.absolute().left(0).right(0).top(start - this.scroll).bottom(LIST_H - (end - this.scroll))
+        ? el.absolute().left(0).right(0).top(start - this.scroll).bottom(listH - (end - this.scroll))
         : el.flex_none().h(end - start);
 
-    const visible = (start, end) => !fixed || (end > this.scroll && start < this.scroll + LIST_H);
+    const visible = (start, end) => !fixed || (end > this.scroll && start < this.scroll + listH);
 
     const list = [];
     results.forEach((item, i) => {
@@ -1005,8 +1042,8 @@ export default class FilesSearch extends View {
     return v_flex()
       .id("files-search-overlay")
       .track_focus(this.handle)
-      .when(this.showPreview, el => el.w(1050))
-      .when(!this.showPreview, el => el.w(680))
+      .relative()
+      .w(winW)
       .min_h(0)
       .p(18)
       .gap(10)
@@ -1015,6 +1052,26 @@ export default class FilesSearch extends View {
       .border_color(t.border)
       .bg(t.popover)
       .shadow_lg()
+      // Mouse move & up handlers for resizing
+      .on_mouse_move((e, cx) => {
+        if (!this.resizing) return;
+        if (this.resizing === "both" || this.resizing === "width") {
+          const dx = e.position.x - this.dragStartX;
+          this.customWidth = Math.max(minW, Math.min(maxW, this.startWidth + dx));
+        }
+        if (this.resizing === "both" || this.resizing === "height") {
+          const dy = e.position.y - this.dragStartY;
+          this.customListHeight = Math.max(minH, Math.min(maxH, this.startListHeight + dy));
+        }
+        cx.notify();
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        if (this.resizing) {
+          this.resizing = null;
+          setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
+          cx.notify();
+        }
+      })
       .on_key_down((e, cx) => {
         const k = e.key;
         if (k === "escape") return this.closeOverlay();
@@ -1131,6 +1188,37 @@ export default class FilesSearch extends View {
               .child(svg("mods/files-search/preview.svg").size(12))
               .child(div().text_size(11).font_medium().child("Preview"))
           )
+          // Maximize / Restore Toggle Button
+          .child(
+            h_flex()
+              .id("files-search-maximize-btn")
+              .size(24)
+              .rounded(5)
+              .cursor_pointer()
+              .items_center()
+              .justify_center()
+              .border_1()
+              .border_color(t.border)
+              .bg(t.raised)
+              .text_color(t.muted)
+              .hover(s => s.text_color(t.foreground).bg(t.hover))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                const isExpanded = Boolean(this.customWidth && this.customWidth >= 1350);
+                if (isExpanded) {
+                  // Restore to normal
+                  this.customWidth = this.showPreview ? 1050 : 680;
+                  this.customListHeight = LIST_H;
+                } else {
+                  // Maximize / Expand
+                  this.customWidth = this.showPreview ? 1400 : 920;
+                  this.customListHeight = 520;
+                }
+                setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
+                cx.notify();
+              })
+              .child(svg(this.customWidth && this.customWidth >= 1350 ? "mods/files-search/restore.svg" : "mods/files-search/maximize.svg").size(12))
+          )
           .child(
             h_flex()
               .gap(4)
@@ -1158,8 +1246,7 @@ export default class FilesSearch extends View {
           // Left column
           .child(
             v_flex()
-              .when(this.showPreview, el => el.w(480))
-              .when(!this.showPreview, el => el.w(644))
+              .w(leftW)
               .flex_none()
               .gap(10)
               .child(
@@ -1199,11 +1286,11 @@ export default class FilesSearch extends View {
                       .relative()
                       .mb(4)
                       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                      .when(fixed, el => el.h(LIST_H).overflow_hidden())
+                      .when(fixed, el => el.h(listH).overflow_hidden())
                       .on_scroll_wheel((e, cx) => {
                         this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, this.maxScroll));
                         while (this.at < results.length - 1 && this.at * ROW_H < this.scroll) this.at++;
-                        while (this.at > 0 && (this.at + 1) * ROW_H > this.scroll + LIST_H) this.at--;
+                        while (this.at > 0 && (this.at + 1) * ROW_H > this.scroll + listH) this.at--;
                         if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
                         cx.notify();
                       })
@@ -1222,8 +1309,67 @@ export default class FilesSearch extends View {
           )
           // Right column: Preview pane
           .when(this.showPreview, el =>
-            el.child(this.renderPreviewPane(t, results[this.at], cx))
+            el.child(this.renderPreviewPane(t, results[this.at], cx, listH, previewW))
           )
+      )
+      // Resize handle grips:
+      // Right edge resize handle
+      .child(
+        div()
+          .id("resize-edge-e")
+          .absolute()
+          .right(0)
+          .top(36)
+          .bottom(14)
+          .w(6)
+          .cursor_ew_resize()
+          .on_mouse_down("left", (e, cx) => {
+            this.resizing = "width";
+            this.dragStartX = e.position.x;
+            this.startWidth = winW;
+            cx.stop_propagation();
+          })
+      )
+      // Bottom edge resize handle
+      .child(
+        div()
+          .id("resize-edge-s")
+          .absolute()
+          .left(16)
+          .right(16)
+          .bottom(0)
+          .h(6)
+          .cursor_ns_resize()
+          .on_mouse_down("left", (e, cx) => {
+            this.resizing = "height";
+            this.dragStartY = e.position.y;
+            this.startListHeight = listH;
+            cx.stop_propagation();
+          })
+      )
+      // Bottom-right corner grip handle
+      .child(
+        div()
+          .id("resize-corner-grip")
+          .absolute()
+          .right(2)
+          .bottom(2)
+          .size(16)
+          .cursor_nwse_resize()
+          .flex()
+          .items_center()
+          .justify_center()
+          .text_color(t.dim)
+          .hover(s => s.text_color(t.foreground))
+          .on_mouse_down("left", (e, cx) => {
+            this.resizing = "both";
+            this.dragStartX = e.position.x;
+            this.dragStartY = e.position.y;
+            this.startWidth = winW;
+            this.startListHeight = listH;
+            cx.stop_propagation();
+          })
+          .child(svg("mods/files-search/grip.svg").size(10))
       );
   }
 
