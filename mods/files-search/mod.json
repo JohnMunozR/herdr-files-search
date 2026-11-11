@@ -1,5 +1,11 @@
 {
   "place": "none",
+  "title": "Search Everywhere",
+  "overlay": {
+    "kind": "dialog",
+    "width": 680,
+    "frame": "none"
+  },
   "cloned_from": {
     "name": "files",
     "version": "0.1.13"

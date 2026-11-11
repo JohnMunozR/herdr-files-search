@@ -79,6 +79,8 @@ export default class FilesSearch extends View {
     this.pending = new Set();
     this.marks = {};
     this.lastSelectedTs = 0;
+    this.lastShiftPress = 0;
+    this.panelHandle = cx.focus_handle();
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
   }
@@ -325,6 +327,7 @@ export default class FilesSearch extends View {
     const t = theme();
     return v_flex()
       .id("files")
+      .track_focus(this.panelHandle)
       .size_full()
       .min_h(0)
       .rounded(10)
@@ -334,6 +337,21 @@ export default class FilesSearch extends View {
       .border_color(t.border)
       .text_color(t.foreground)
       .text_size(13)
+      .on_key_down((e, cx) => {
+        // IntelliJ Shift-Shift shortcut detection
+        const now = Date.now();
+        if (e.key === "shift" || e.keystroke === "shift") {
+          if (now - this.lastShiftPress < 450) {
+            this.openSearchOverlay();
+            this.lastShiftPress = 0;
+            cx.stop_propagation();
+            return;
+          }
+          this.lastShiftPress = now;
+        } else {
+          this.lastShiftPress = 0;
+        }
+      })
       .child(
         h_flex()
           .h(42)
@@ -433,23 +451,25 @@ export default class FilesSearch extends View {
 
     cx.spawn(async cx => {
       try {
-        // Fast file listing using git or rg or find
         let list = [];
-        const gitRes = await exec("git", ["ls-files", "--cached", "--others", "--exclude-standard"], { cwd: root, on }).catch(() => null);
-        if (gitRes?.code === 0 && gitRes.stdout.trim()) {
-          list = gitRes.stdout.split("\n").map(s => s.trim()).filter(Boolean);
+        // Script that lists all workspace files with no depth truncation
+        const script = 'if command -v rg >/dev/null 2>&1; then rg --files --hidden --glob "!.git" 2>/dev/null; elif git rev-parse --show-toplevel >/dev/null 2>&1; then git ls-files --cached --others --exclude-standard; else find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -type f | sed "s|^./||"; fi';
+        const res = await exec("sh", ["-c", script], { cwd: root, on }).catch(() => null);
+        if (res?.code === 0 && res.stdout.trim()) {
+          list = res.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
         } else {
-          const rgRes = await exec("rg", ["--files", "--max-depth", "8"], { cwd: root, on }).catch(() => null);
-          if (rgRes?.code === 0 && rgRes.stdout.trim()) {
-            list = rgRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
+          // Fallback direct calls
+          const gitRes = await exec("git", ["ls-files", "--cached", "--others", "--exclude-standard"], { cwd: root, on }).catch(() => null);
+          if (gitRes?.code === 0 && gitRes.stdout.trim()) {
+            list = gitRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
           } else {
-            const findRes = await exec("sh", ["-c", 'find . -maxdepth 6 -not -path "*/.*" -type f | sed "s|^./||"'], { cwd: root, on }).catch(() => null);
-            if (findRes?.code === 0) {
-              list = findRes.stdout.split("\n").map(s => s.trim()).filter(Boolean);
+            const rgRes = await exec("rg", ["--files", "--hidden", "--glob", "!.git"], { cwd: root, on }).catch(() => null);
+            if (rgRes?.code === 0 && rgRes.stdout.trim()) {
+              list = rgRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
             }
           }
         }
-        this.fileList = list.slice(0, 8000);
+        this.fileList = list.slice(0, 15000);
       } catch (err) {
         this.fileList = [];
       } finally {
@@ -537,12 +557,13 @@ export default class FilesSearch extends View {
 
   // Returns array of items: { kind: 'file'|'text', path, name, hits, score, line?, content?, matchedQuery? }
   searchResults() {
-    const q = this.query.trim().toLowerCase();
+    const rawQ = this.query.trim().toLowerCase();
+    const q = rawQ.replace(/\s+/g, "");
 
     // 1. Matched files
     let matchedFiles = [];
     if (this.tab === "all" || this.tab === "files") {
-      if (!q) {
+      if (!rawQ) {
         matchedFiles = this.fileList.slice(0, 30).map(path => {
           const name = path.split("/").pop() || path;
           return { kind: "file", path, name, score: 0, hits: [] };
@@ -559,13 +580,13 @@ export default class FilesSearch extends View {
               kind: "file",
               path,
               name,
-              score: best.score + (matchName ? 5 : 0),
-              hits: matchName ? best.hits : [],
+              score: best.score + (matchName ? 10 : 0),
+              hits: matchName ? matchName.hits : [],
             });
           }
         }
         scored.sort((a, b) => b.score - a.score);
-        matchedFiles = scored.slice(0, 40);
+        matchedFiles = scored.slice(0, 50);
       }
     }
 
@@ -576,7 +597,7 @@ export default class FilesSearch extends View {
     if (this.tab === "text") return textItems;
 
     // "All": top files, then top text results
-    return [...matchedFiles.slice(0, 20), ...textItems.slice(0, 20)];
+    return [...matchedFiles.slice(0, 25), ...textItems.slice(0, 25)];
   }
 
   renderHighlightedTitle(t, text, hits, isSelected) {
