@@ -265,7 +265,8 @@ export default class FilesSearch extends View {
     const currentLoc = location();
     openOverlay({
       mod: "files-search",
-      kind: "dialog",
+      kind: "window",
+      key: "files-search-win",
       width: 680,
       frame: "none",
       props: {
@@ -742,19 +743,21 @@ export default class FilesSearch extends View {
         cx.stop_propagation();
         cx.notify();
       })
-      // Header: IntelliJ style segmented tabs (All | Files | Text)
+      // Header: IntelliJ style segmented tabs (All | Files | Text) & Draggable Title Bar
       .child(
         h_flex()
-          .h(28)
+          .h(30)
           .flex_none()
           .gap(6)
           .items_center()
+          .cursor_grab()
           .child(
             h_flex()
               .gap(2)
               .p(2)
               .rounded(6)
               .bg(t.raised)
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .child(
                 div()
                   .px(9)
@@ -803,6 +806,7 @@ export default class FilesSearch extends View {
             h_flex()
               .gap(4)
               .items_center()
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .child(div().text_size(11).text_color(t.dim).child("Tab to switch"))
               .child(
                 div()
@@ -829,6 +833,7 @@ export default class FilesSearch extends View {
           .border_1()
           .border_color(t.accent)
           .bg(t.background)
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .child(svg("mods/files-search/search.svg").size(15).text_color(t.dim))
           .child(Input.new(this.input).flex_1().h_full().text_size(12.8).text_color(t.foreground))
           .child(
@@ -840,6 +845,9 @@ export default class FilesSearch extends View {
               .bg(t.raised)
               .text_size(11)
               .text_color(t.dim)
+              .cursor_pointer()
+              .hover(s => s.text_color(t.foreground))
+              .on_click(() => this.closeOverlay())
               .child("Esc")
           )
       )
@@ -850,6 +858,7 @@ export default class FilesSearch extends View {
               .id("search-rows")
               .relative()
               .mb(4)
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .when(fixed, el => el.h(LIST_H).overflow_hidden())
               .on_scroll_wheel((e, cx) => {
                 this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, this.maxScroll));

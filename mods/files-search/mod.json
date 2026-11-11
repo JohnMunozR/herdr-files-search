@@ -2,7 +2,8 @@
   "place": "none",
   "title": "Search Everywhere",
   "overlay": {
-    "kind": "dialog",
+    "kind": "window",
+    "key": "files-search-win",
     "width": 680,
     "frame": "none"
   },
