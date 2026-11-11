@@ -338,12 +338,16 @@ export default class FilesSearch extends View {
       .text_color(t.foreground)
       .text_size(13)
       .on_key_down((e, cx) => {
-        // IntelliJ Shift-Shift shortcut detection
+        // IntelliJ double Shift shortcut detection
+        // Ignore key repeat when Shift is held down
+        if (e.is_held) return;
         const now = Date.now();
-        if (e.key === "shift" || e.keystroke === "shift") {
-          if (now - this.lastShiftPress < 450) {
-            this.openSearchOverlay();
+        if (e.key === "shift" || e.keystroke === "shift" || e.keystroke === "shift-shift") {
+          // Double shift press must be between 60ms (not a bounce/repeat) and 450ms
+          const diff = now - this.lastShiftPress;
+          if (diff >= 60 && diff <= 450) {
             this.lastShiftPress = 0;
+            this.openSearchOverlay();
             cx.stop_propagation();
             return;
           }
