@@ -267,7 +267,6 @@ export default class FilesSearch extends View {
       mod: "files-search",
       kind: "window",
       key: "files-search-win",
-      width: 680,
       frame: "none",
       props: {
         role: "search",
@@ -413,12 +412,26 @@ export default class FilesSearch extends View {
     this.scroll = 0;
     this.handle = cx.focus_handle();
 
+    // Preview state (default enabled, remembers user preference)
+    const savedPreview = shared("files-search.preview");
+    this.showPreview = savedPreview !== null && savedPreview !== undefined ? Boolean(savedPreview) : true;
+    this.previewItem = null;
+    this.previewLines = [];
+    this.previewLoading = false;
+    this.previewError = null;
+    this.previewScroll = 0;
+    this.previewCache = new Map();
+
     this.input = InputState.new({ placeholder: "Search everywhere by name or text (Tab to switch)..." });
     this.input.on("change", (_e, cx) => {
       this.query = this.input.value();
       this.at = 0;
       this.scroll = 0;
       this.triggerTextSearch(cx);
+      if (this.showPreview) {
+        const items = this.searchResults();
+        this.updatePreview(items[0], cx);
+      }
       cx.notify();
     });
     this.input.on("submit", (_e, cx) => {
@@ -447,6 +460,71 @@ export default class FilesSearch extends View {
     });
     this.closeOverlay();
     cx.notify();
+  }
+
+  updatePreview(item, cx) {
+    if (!item) {
+      this.previewItem = null;
+      this.previewLines = [];
+      this.previewError = null;
+      this.previewLoading = false;
+      return;
+    }
+    this.previewItem = item;
+    const cached = this.previewCache.get(item.path);
+    if (cached !== undefined) {
+      this.previewLines = cached;
+      this.previewError = null;
+      this.previewLoading = false;
+      if (item.kind === "text" && item.line) {
+        this.previewScroll = Math.max(0, item.line - 6);
+      } else {
+        this.previewScroll = 0;
+      }
+      return;
+    }
+
+    this.previewLoading = true;
+    this.previewError = null;
+    this.previewLines = [];
+
+    const root = this.searchRoot;
+    const on = this.searchOn;
+    const targetPath = item.path;
+
+    cx.spawn(async cx => {
+      try {
+        const fullPath = `${root}/${targetPath}`;
+        const text = await readTextFile(fullPath, { on });
+        if (this.previewItem?.path !== targetPath) return;
+        if (text === null) {
+          this.previewError = "File not found";
+          return;
+        }
+        if (text.includes("\0")) {
+          this.previewError = "Binary file · no text preview";
+          return;
+        }
+        const clean = text.length > 400000 ? text.slice(0, 400000) : text;
+        const lines = clean.split("\n");
+        this.previewCache.set(targetPath, lines);
+        this.previewLines = lines;
+        if (item.kind === "text" && item.line) {
+          this.previewScroll = Math.max(0, item.line - 6);
+        } else {
+          this.previewScroll = 0;
+        }
+      } catch (err) {
+        if (this.previewItem?.path === targetPath) {
+          this.previewError = "Cannot preview this file";
+        }
+      } finally {
+        if (this.previewItem?.path === targetPath) {
+          this.previewLoading = false;
+          cx.notify();
+        }
+      }
+    });
   }
 
   async loadWorkspaceFiles(cx) {
@@ -549,6 +627,10 @@ export default class FilesSearch extends View {
     this.scroll = 0;
     if (tab === "text" || tab === "all") {
       this.triggerTextSearch(cx);
+    }
+    if (this.showPreview) {
+      const items = this.searchResults();
+      this.updatePreview(items[0], cx);
     }
     cx.notify();
   }
@@ -654,10 +736,205 @@ export default class FilesSearch extends View {
       .child(div().text_color(t.dim).child(after.replace(/ /g, "\u00a0")));
   }
 
+  renderHighlightedCodeLine(t, text, query) {
+    if (!text || !query) return div().child(text ? text.replace(/\t/g, "    ").replace(/ /g, "\u00a0") : "\u00a0");
+    const clean = text.replace(/\t/g, "    ");
+    const lowerText = clean.toLowerCase();
+    const lowerQ = query.toLowerCase();
+    const idx = lowerText.indexOf(lowerQ);
+    if (idx < 0) {
+      return div().child(clean ? clean.replace(/ /g, "\u00a0") : "\u00a0");
+    }
+    const before = clean.slice(0, idx);
+    const match = clean.slice(idx, idx + query.length);
+    const after = clean.slice(idx + query.length);
+
+    return h_flex()
+      .child(div().child(before.replace(/ /g, "\u00a0")))
+      .child(
+        div()
+          .bg(t.accent)
+          .text_color(t.background)
+          .font_semibold()
+          .rounded(2)
+          .px(2)
+          .child(match.replace(/ /g, "\u00a0"))
+      )
+      .child(div().child(after.replace(/ /g, "\u00a0")));
+  }
+
+  renderPreviewPane(t, item, cx) {
+    if (!item) {
+      return v_flex()
+        .w(520)
+        .h(LIST_H + 46)
+        .rounded(8)
+        .border_1()
+        .border_color(t.border)
+        .bg(t.background)
+        .justify_center()
+        .items_center()
+        .child(div().text_size(12).text_color(t.dim).child("Select an item to preview"));
+    }
+
+    const isTextMatch = item.kind === "text" && item.line;
+    const targetLine = isTextMatch ? item.line : null;
+    const fileName = item.path.split("/").pop() || item.path;
+    const dirPath = item.path.includes("/") ? item.path.slice(0, item.path.lastIndexOf("/")) : "";
+
+    const VISIBLE_ROWS = 15;
+    const LINE_H = 21;
+    const maxScroll = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
+    this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxScroll));
+
+    const visibleLines = [];
+    const startIdx = this.previewScroll;
+    const endIdx = Math.min(this.previewLines.length, startIdx + VISIBLE_ROWS);
+
+    for (let i = startIdx; i < endIdx; i++) {
+      const lineNum = i + 1;
+      const isTarget = lineNum === targetLine;
+      const lineContent = this.previewLines[i] ?? "";
+
+      visibleLines.push(
+        h_flex()
+          .h(LINE_H)
+          .flex_none()
+          .items_center()
+          .px(4)
+          .gap(8)
+          .when(isTarget, el => el.bg(t.selected).border_l(3).border_color(t.accent))
+          .when(!isTarget, el => el.border_l(3).border_color(t.background))
+          // Line Number Gutter
+          .child(
+            div()
+              .w(38)
+              .flex_none()
+              .text_right()
+              .text_size(11)
+              .font_family(settings()?.font_family || "monospace")
+              .text_color(isTarget ? t.ansi3 : t.dim)
+              .when(isTarget, el => el.font_semibold())
+              .child(String(lineNum))
+          )
+          // Line Content
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(11.5)
+              .font_family(settings()?.font_family || "monospace")
+              .text_color(isTarget ? t.foreground : t.muted)
+              .when(isTarget && item.matchedQuery, el =>
+                el.child(this.renderHighlightedCodeLine(t, lineContent, item.matchedQuery))
+              )
+              .when(!isTarget || !item.matchedQuery, el =>
+                el.child(lineContent ? lineContent.replace(/\t/g, "    ").replace(/ /g, "\u00a0") : "\u00a0")
+              )
+          )
+      );
+    }
+
+    return v_flex()
+      .w(520)
+      .h(LIST_H + 46)
+      .flex_none()
+      .rounded(8)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.background)
+      .overflow_hidden()
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      // Preview Header
+      .child(
+        h_flex()
+          .h(34)
+          .flex_none()
+          .px(10)
+          .gap(7)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .bg(t.raised)
+          .child(svg("mods/files-search/file.svg").size(13).flex_none().text_color(t.dim))
+          .child(div().text_size(12).font_semibold().text_color(t.foreground).child(fileName))
+          .when(Boolean(dirPath), el =>
+            el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(dirPath))
+          )
+          .when(!dirPath, el => el.child(div().flex_1()))
+          .when(Boolean(targetLine), el =>
+            el.child(
+              div()
+                .px(6)
+                .py(1)
+                .rounded(4)
+                .bg(t.selected)
+                .border_1()
+                .border_color(t.accent)
+                .text_size(11)
+                .font_family(settings()?.font_family || "monospace")
+                .font_semibold()
+                .text_color(t.ansi3)
+                .child(`line ${targetLine}`)
+            )
+          )
+          .when(!targetLine && this.previewLines.length > 0, el =>
+            el.child(div().text_size(11).text_color(t.dim).child(`${this.previewLines.length} lines`))
+          )
+          .child(
+            div()
+              .px(7)
+              .py(1.5)
+              .rounded(4)
+              .bg(t.background)
+              .border_1()
+              .border_color(t.border)
+              .text_size(11)
+              .text_color(t.dim)
+              .cursor_pointer()
+              .hover(s => s.bg(t.hover).text_color(t.foreground))
+              .on_click(() => this.selectResult(item, cx))
+              .child("Open ↵")
+          )
+      )
+      // Preview Body
+      .child(
+        v_flex()
+          .flex_1()
+          .min_h(0)
+          .overflow_hidden()
+          .py(4)
+          .on_scroll_wheel((e, cx) => {
+            const delta = e.delta.y > 0 ? -3 : 3;
+            this.previewScroll = Math.max(0, Math.min(maxScroll, this.previewScroll + delta));
+            cx.notify();
+          })
+          .when(this.previewLoading, el =>
+            el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Loading preview…"))
+          )
+          .when(!this.previewLoading && Boolean(this.previewError), el =>
+            el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child(this.previewError))
+          )
+          .when(!this.previewLoading && !this.previewError && visibleLines.length === 0, el =>
+            el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file"))
+          )
+          .when(!this.previewLoading && !this.previewError && visibleLines.length > 0, el =>
+            el.children(visibleLines)
+          )
+      );
+  }
+
   renderOverlay(cx) {
     const t = theme();
     const results = this.searchResults();
     this.at = Math.min(this.at, Math.max(0, results.length - 1));
+    const currentItem = results[this.at];
+    if (this.showPreview && currentItem) {
+      if (!this.previewItem || this.previewItem.path !== currentItem.path || this.previewItem.line !== currentItem.line) {
+        this.updatePreview(currentItem, cx);
+      }
+    }
 
     const total = results.length * ROW_H;
     const fixed = total > LIST_H;
@@ -696,7 +973,15 @@ export default class FilesSearch extends View {
           .text_size(12.5)
           .when(on, el => el.bg(t.selected))
           .hover(s => s.bg(t.hover))
-          .on_click((_e, cx) => this.selectResult(item, cx))
+          .on_click((_e, cx) => {
+            if (this.showPreview && i !== this.at) {
+              this.at = i;
+              this.updatePreview(item, cx);
+              cx.notify();
+            } else {
+              this.selectResult(item, cx);
+            }
+          })
           .child(
             svg(`mods/files-search/${isFile ? "file" : "search"}.svg`)
               .size(13)
@@ -720,11 +1005,16 @@ export default class FilesSearch extends View {
     return v_flex()
       .id("files-search-overlay")
       .track_focus(this.handle)
-      .w_full()
+      .when(this.showPreview, el => el.w(1050))
+      .when(!this.showPreview, el => el.w(680))
       .min_h(0)
       .p(18)
       .gap(10)
+      .rounded(10)
+      .border_1()
+      .border_color(t.border)
       .bg(t.popover)
+      .shadow_lg()
       .on_key_down((e, cx) => {
         const k = e.key;
         if (k === "escape") return this.closeOverlay();
@@ -733,11 +1023,23 @@ export default class FilesSearch extends View {
           cx.stop_propagation();
           return;
         }
-        if (k === "down") this.at = Math.min(this.at + 1, results.length - 1);
-        else if (k === "up") this.at = Math.max(this.at - 1, 0);
-        else if (k === "pagedown") this.at = Math.min(this.at + SHOWN, results.length - 1);
-        else if (k === "pageup") this.at = Math.max(this.at - SHOWN, 0);
-        else if (k === "enter") {
+        if (k === "down") {
+          this.at = Math.min(this.at + 1, results.length - 1);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+        } else if (k === "up") {
+          this.at = Math.max(this.at - 1, 0);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+        } else if (k === "pagedown") {
+          this.at = Math.min(this.at + SHOWN, results.length - 1);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+        } else if (k === "pageup") {
+          this.at = Math.max(this.at - SHOWN, 0);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+        } else if ((e.alt && k === "p") || (e.control && k === "p")) {
+          this.showPreview = !this.showPreview;
+          setShared("files-search.preview", this.showPreview);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+        } else if (k === "enter") {
           if (results[this.at]) this.selectResult(results[this.at], cx);
         } else return;
         cx.stop_propagation();
@@ -802,6 +1104,33 @@ export default class FilesSearch extends View {
           .when(this.isSearchingText, el =>
             el.child(div().text_size(11).text_color(t.dim).child("Searching text…"))
           )
+          // Preview Toggle Button
+          .child(
+            h_flex()
+              .id("files-search-preview-toggle")
+              .gap(5)
+              .items_center()
+              .px(8)
+              .h(24)
+              .rounded(5)
+              .cursor_pointer()
+              .border_1()
+              .border_color(this.showPreview ? t.accent : t.border)
+              .bg(this.showPreview ? t.selected : t.raised)
+              .text_color(this.showPreview ? t.foreground : t.muted)
+              .hover(s => s.text_color(t.foreground))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                this.showPreview = !this.showPreview;
+                setShared("files-search.preview", this.showPreview);
+                if (this.showPreview && results[this.at]) {
+                  this.updatePreview(results[this.at], cx);
+                }
+                cx.notify();
+              })
+              .child(svg("mods/files-search/preview.svg").size(12))
+              .child(div().text_size(11).font_medium().child("Preview"))
+          )
           .child(
             h_flex()
               .gap(4)
@@ -821,62 +1150,80 @@ export default class FilesSearch extends View {
               )
           )
       )
-      // Search Input
+      // Content body: left column (Input + Results) and right column (Preview pane when enabled)
       .child(
         h_flex()
-          .h(36)
-          .flex_none()
-          .px(10)
-          .gap(10)
-          .items_center()
-          .rounded(9)
-          .border_1()
-          .border_color(t.accent)
-          .bg(t.background)
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .child(svg("mods/files-search/search.svg").size(15).text_color(t.dim))
-          .child(Input.new(this.input).flex_1().h_full().text_size(12.8).text_color(t.foreground))
+          .gap(12)
+          .items_start()
+          // Left column
           .child(
-            div()
-              .px(5)
-              .rounded(4)
-              .border_1()
-              .border_color(t.border)
-              .bg(t.raised)
-              .text_size(11)
-              .text_color(t.dim)
-              .cursor_pointer()
-              .hover(s => s.text_color(t.foreground))
-              .on_click(() => this.closeOverlay())
-              .child("Esc")
-          )
-      )
-      // Results list
-      .child(
-        results.length
-          ? div()
-              .id("search-rows")
-              .relative()
-              .mb(4)
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .when(fixed, el => el.h(LIST_H).overflow_hidden())
-              .on_scroll_wheel((e, cx) => {
-                this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, this.maxScroll));
-                while (this.at < results.length - 1 && this.at * ROW_H < this.scroll) this.at++;
-                while (this.at > 0 && (this.at + 1) * ROW_H > this.scroll + LIST_H) this.at--;
-                cx.notify();
-              })
-              .children(fixed ? list : [v_flex().children(list)])
-          : div()
-              .px(16)
-              .py(16)
-              .text_size(12.5)
-              .text_color(t.dim)
+            v_flex()
+              .when(this.showPreview, el => el.w(480))
+              .when(!this.showPreview, el => el.w(644))
+              .flex_none()
+              .gap(10)
               .child(
-                this.query.trim()
-                  ? `No matches found for "${this.query}".`
-                  : "Type to search files or text across workspace..."
+                // Search Input
+                h_flex()
+                  .h(36)
+                  .flex_none()
+                  .px(10)
+                  .gap(10)
+                  .items_center()
+                  .rounded(9)
+                  .border_1()
+                  .border_color(t.accent)
+                  .bg(t.background)
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .child(svg("mods/files-search/search.svg").size(15).text_color(t.dim))
+                  .child(Input.new(this.input).flex_1().h_full().text_size(12.8).text_color(t.foreground))
+                  .child(
+                    div()
+                      .px(5)
+                      .rounded(4)
+                      .border_1()
+                      .border_color(t.border)
+                      .bg(t.raised)
+                      .text_size(11)
+                      .text_color(t.dim)
+                      .cursor_pointer()
+                      .hover(s => s.text_color(t.foreground))
+                      .on_click(() => this.closeOverlay())
+                      .child("Esc")
+                  )
               )
+              .child(
+                results.length
+                  ? div()
+                      .id("search-rows")
+                      .relative()
+                      .mb(4)
+                      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                      .when(fixed, el => el.h(LIST_H).overflow_hidden())
+                      .on_scroll_wheel((e, cx) => {
+                        this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, this.maxScroll));
+                        while (this.at < results.length - 1 && this.at * ROW_H < this.scroll) this.at++;
+                        while (this.at > 0 && (this.at + 1) * ROW_H > this.scroll + LIST_H) this.at--;
+                        if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+                        cx.notify();
+                      })
+                      .children(fixed ? list : [v_flex().children(list)])
+                  : div()
+                      .px(16)
+                      .py(16)
+                      .text_size(12.5)
+                      .text_color(t.dim)
+                      .child(
+                        this.query.trim()
+                          ? `No matches found for "${this.query}".`
+                          : "Type to search files or text across workspace..."
+                      )
+              )
+          )
+          // Right column: Preview pane
+          .when(this.showPreview, el =>
+            el.child(this.renderPreviewPane(t, results[this.at], cx))
+          )
       );
   }
 
