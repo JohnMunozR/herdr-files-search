@@ -1,150 +1,188 @@
 #!/usr/bin/env bash
-# Installer script for herdr-files-search
-# Complies with Herdr's mod distribution and installation specification (AGENTS.md)
+# herdr-files-search: installer for the Herdr desktop app
+# Complies with Herdr's official mod distribution specification (AGENTS.md)
+#
+# Usage:
+#   ./install.sh [--home DIR] [--app-bin PATH]
+#   ./install.sh --uninstall [--home DIR] [--app-bin PATH]
+#
+# Options:
+#   --home DIR        Herdr configuration directory (default: $HERDR_APP_HOME or ~/.config/herdr-app)
+#   --app-bin PATH    Path to herdr-app executable
+#   --uninstall       Revert layout back to standard 'files' mod, remove shortcuts, and remove 'files-search'
+#   -h, --help        Show this help message
+
 set -euo pipefail
 
-HERDR_DIR="${HOME}/.config/herdr-app"
-MOD_DIR="${HERDR_DIR}/mods/files-search"
-REPO_URL="https://github.com/JohnMunozR/herdr-files-search"
-BRANCH="main"
+here="$(cd "$(dirname "$0")" && pwd)"
+mod_src="$here/mods/files-search"
+home="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
+app_bin="${HERDR_APP_BIN:-}"
+mode="install"
+repo_url="https://github.com/JohnMunozR/herdr-files-search"
+branch="main"
 
-echo "=== Installing herdr-files-search mod ==="
+say() { echo "herdr-files-search: $*"; }
+die() { echo "herdr-files-search: error: $*" >&2; exit 1; }
 
-# 1. Check prerequisites
-if ! command -v herdr-app >/dev/null 2>&1; then
-  echo "Error: herdr-app executable was not found on PATH." >&2
-  echo "Please ensure Herdr desktop app is installed and on your PATH." >&2
-  exit 1
-fi
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uninstall) mode="uninstall" ;;
+    --home) [ $# -ge 2 ] || die "--home requires a directory"; home="$2"; shift ;;
+    --app-bin) [ $# -ge 2 ] || die "--app-bin requires a path"; app_bin="$2"; shift ;;
+    -h|--help)
+      sed -n '2,13p' "$0" | sed 's/^# *//'
+      exit 0
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+  shift
+done
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Error: python3 was not found on PATH (needed for safe JSON configuration)." >&2
-  exit 1
-fi
+find_app_bin() {
+  if [ -n "$app_bin" ]; then echo "$app_bin"; return; fi
+  if command -v herdr-app >/dev/null 2>&1; then command -v herdr-app; return; fi
+  if [ -x "$HOME/.local/bin/herdr-app" ]; then echo "$HOME/.local/bin/herdr-app"; return; fi
+  echo ""
+}
 
-# Ensure directories exist
-mkdir -p "${MOD_DIR}"
-mkdir -p "${HERDR_DIR}/layouts"
+HERDR_BIN="$(find_app_bin)"
 
-# 2. Copy mod files
-SCRIPT_DIR=""
-if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
+target_mods="$home/mods"
+target_mod="$target_mods/files-search"
+layouts_dir="$home/layouts"
+keys_file="$home/keys.json"
 
-if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/mods/files-search/main.js" ]; then
-  echo "--> Installing mod files from local directory..."
-  cp -r "${SCRIPT_DIR}/mods/files-search/"* "${MOD_DIR}/"
-else
-  echo "--> Downloading release files from ${REPO_URL} (${BRANCH})..."
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "${TMP_DIR}"' EXIT
-  curl -fsSL "${REPO_URL}/archive/refs/heads/${BRANCH}.tar.gz" | tar -xz -C "${TMP_DIR}"
-  cp -r "${TMP_DIR}/herdr-files-search-${BRANCH}/mods/files-search/"* "${MOD_DIR}/"
-fi
+if [ "$mode" = "uninstall" ]; then
+  say "Uninstalling files-search mod..."
 
-# 3. Check mod syntax per Herdr documentation: herdr-app check <mod folder>
-echo "--> Verifying mod syntax and types with herdr-app check..."
-herdr-app check "${MOD_DIR}" || herdr-app check "${MOD_DIR}/main.js"
+  # 1. Revert layouts pointing to files-search back to files
+  if [ -d "$layouts_dir" ]; then
+    for lfile in "$layouts_dir"/*.json; do
+      [ -f "$lfile" ] || continue
+      if grep -q '"files-search"' "$lfile" 2>/dev/null; then
+        sed -i 's/"mod": *"files-search"/"mod": "files"/g' "$lfile"
+        say "Reverted $lfile to use default 'files' mod"
+      fi
+    done
+    if [ -d "$layouts_dir/.state" ]; then
+      for sfile in "$layouts_dir/.state"/*.json; do
+        [ -f "$sfile" ] || continue
+        if grep -q '"files-search"' "$sfile" 2>/dev/null; then
+          sed -i 's/"mod": *"files-search"/"mod": "files"/g' "$sfile"
+        fi
+      done
+    fi
+  fi
 
-# 4. Layout configuration complying with Herdr layout immutability:
-# Shipped layouts (main, terminals, win98) are read-only and replaced on start.
-# Customizations belong to personal clones (e.g. main-copy).
-echo "--> Configuring Herdr layouts..."
-python3 -c "
-import json, os, subprocess
-
-herdr_dir = os.path.expanduser('${HERDR_DIR}')
-layouts_dir = os.path.join(herdr_dir, 'layouts')
-shared_path = os.path.join(herdr_dir, 'shared.json')
-
-shipped_names = {'main', 'terminals', 'win98'}
-
-# Read current active layout
-active_layout = 'main'
-shared_data = {}
-if os.path.exists(shared_path):
-    try:
-        shared_data = json.load(open(shared_path))
-        active_layout = shared_data.get('layout', 'main')
-    except Exception:
-        pass
-
-target_layout_name = active_layout
-if active_layout in shipped_names:
-    target_layout_name = f'{active_layout}-copy'
-
-target_file = os.path.join(layouts_dir, f'{target_layout_name}.json')
-
-# If target clone does not exist yet, clone it from shipped layout
-if not os.path.exists(target_file):
-    source_file = os.path.join(layouts_dir, f'{active_layout}.json')
-    if os.path.exists(source_file):
-        try:
-            data = json.load(open(source_file))
-            data['cloned_from'] = {'name': active_layout}
-            with open(target_file, 'w') as f:
-                json.dump(data, f, indent=2)
-            print(f'    Created personal layout clone: {target_layout_name}.json')
-        except Exception as e:
-            print(f'    Notice: could not clone layout: {e}')
-
-# Update all non-shipped layout files to reference files-search instead of files
-for fname in os.listdir(layouts_dir):
-    if not fname.endswith('.json'):
-        continue
-    base_name = fname[:-5]
-    if base_name in shipped_names:
-        continue  # Preserve shipped layouts untouched per Herdr rules
-    
-    file_path = os.path.join(layouts_dir, fname)
-    try:
-        with open(file_path, 'r') as f:
-            content = f.read()
-        if '\"mod\": \"files\"' in content:
-            new_content = content.replace('\"mod\": \"files\"', '\"mod\": \"files-search\"')
-            with open(file_path, 'w') as f:
-                f.write(new_content)
-            print(f'    Updated layout: {fname}')
-    except Exception as e:
-        print(f'    Error updating {fname}: {e}')
-
-# Ensure active layout switches to the customized layout
-if target_layout_name != active_layout:
-    shared_data['layout'] = target_layout_name
-    try:
-        with open(shared_path, 'w') as f:
-            json.dump(shared_data, f, indent=2)
-    except Exception:
-        pass
-"
-
-# If Herdr is actively running, switch/reload the layout live
-if herdr-app status >/dev/null 2>&1; then
-  echo "--> Herdr is running, activating layout..."
-  TARGET_LAYOUT="$(python3 -c "
+  # 2. Remove shortcuts from keys.json if they point to files-search
+  if [ -f "$keys_file" ] && command -v python3 >/dev/null 2>&1; then
+    python3 -c "
 import json, os
 try:
-    shared = json.load(open(os.path.expanduser('${HERDR_DIR}/shared.json')))
-    print(shared.get('layout', 'main-copy'))
-except:
-    print('main-copy')
-")"
-  herdr-app do layout.switch "{\"name\":\"${TARGET_LAYOUT}\"}" >/dev/null 2>&1 || true
+    path = os.path.expanduser('${keys_file}')
+    if os.path.exists(path):
+        keys = json.load(open(path))
+        changed = False
+        for sec in ('global', 'window'):
+            if sec in keys:
+                for k in list(keys[sec].keys()):
+                    if 'files-search' in str(keys[sec][k]):
+                        del keys[sec][k]
+                        changed = True
+        if changed:
+            with open(path, 'w') as f:
+                json.dump(keys, f, indent=2)
+            print('herdr-files-search: Removed files-search shortcuts from keys.json')
+except Exception as e:
+    pass
+"
+  fi
+
+  # 3. Remove mod directory
+  if [ -d "$target_mod" ]; then
+    rm -rf "$target_mod"
+    say "Removed $target_mod"
+  fi
+
+  say "Uninstallation complete. Reloading layout..."
+  if [ -n "$HERDR_BIN" ]; then
+    "$HERDR_BIN" do layout.switch '{"name":"main"}' 2>/dev/null || true
+  fi
+  exit 0
 fi
 
-# 5. Merge keys.json per Herdr documentation:
-# 'A mod's keys.json: merge it into the person's. Add its sections and keys, and ask before replacing a key they already use.'
-echo "--> Merging shortcuts in keys.json..."
-KEYS_FILE="${HERDR_DIR}/keys.json"
-python3 -c "
+# Mode: install
+say "Installing files-search mod into: $target_mod"
+
+tmp_dir=""
+cleanup() {
+  if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
+    rm -rf "$tmp_dir"
+  fi
+}
+trap cleanup EXIT
+
+if [ ! -d "$mod_src" ]; then
+  say "Fetching herdr-files-search files from GitHub..."
+  tmp_dir="$(mktemp -d)"
+  if command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    curl -fsSL "${repo_url}/archive/refs/heads/${branch}.tar.gz" | tar -xz -C "$tmp_dir"
+    mod_src="$tmp_dir/herdr-files-search-${branch}/mods/files-search"
+  elif command -v git >/dev/null 2>&1; then
+    git clone --depth 1 "$repo_url.git" "$tmp_dir/repo"
+    mod_src="$tmp_dir/repo/mods/files-search"
+  else
+    die "Cannot download files: neither curl+tar nor git are available"
+  fi
+fi
+
+[ -d "$mod_src" ] || die "Mod source directory not found: $mod_src"
+
+mkdir -p "$target_mods"
+rm -rf "$target_mod"
+cp -r "$mod_src" "$target_mod"
+
+if [ -n "$HERDR_BIN" ]; then
+  say "Verifying mod with herdr-app check..."
+  "$HERDR_BIN" check "$target_mod" || die "Mod validation failed."
+fi
+
+# Ensure personal layout (main-copy.json) exists
+mkdir -p "$layouts_dir"
+personal_layout="$layouts_dir/main-copy.json"
+orig_layout="$layouts_dir/main.json"
+
+if [ ! -f "$personal_layout" ]; then
+  if [ -n "$HERDR_BIN" ]; then
+    say "Cloning main layout to main-copy..."
+    "$HERDR_BIN" do layout.clone '{"name":"main","as":"main-copy"}' 2>/dev/null || true
+  fi
+  if [ ! -f "$personal_layout" ] && [ -f "$orig_layout" ]; then
+    cp "$orig_layout" "$personal_layout"
+  fi
+fi
+
+if [ -f "$personal_layout" ]; then
+  # Configure files-search in personal layout
+  sed -i 's/"mod": *"files"/"mod": "files-search"/g' "$personal_layout"
+  say "Configured 'files-search' in $personal_layout"
+
+  if [ -f "$layouts_dir/.state/main-copy.json" ]; then
+    sed -i 's/"mod": *"files"/"mod": "files-search"/g' "$layouts_dir/.state/main-copy.json"
+  fi
+fi
+
+# Merge shortcuts into keys.json per AGENTS.md rule 4
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c "
 import json, os
 
-keys_path = os.path.expanduser('${KEYS_FILE}')
+path = os.path.expanduser('${keys_file}')
 keys = {}
-if os.path.exists(keys_path):
+if os.path.exists(path):
     try:
-        keys = json.load(open(keys_path))
+        keys = json.load(open(path))
     except Exception:
         keys = {}
 
@@ -155,17 +193,17 @@ if 'global' not in keys:
 keys['global'].setdefault('ctrl-p', 'mod.open:files-search')
 keys['global'].setdefault('alt-f', 'mod.open:files-search')
 
-with open(keys_path, 'w') as f:
+with open(path, 'w') as f:
     json.dump(keys, f, indent=2)
-print('    Registered Ctrl+P and Alt+F for Search Everywhere in keys.json')
+print('herdr-files-search: Registered Ctrl+P and Alt+F in keys.json')
 "
+fi
 
-echo ""
-echo "=== Installation completed successfully! ==="
-echo "The 'files-search' mod is active at: ${MOD_DIR}"
-echo "Features enabled:"
-echo "  • Files header search button with centered magnifying glass icon"
-echo "  • IntelliJ-style Search Everywhere floating window (All | Files | Text)"
-echo "  • Draggable header & robust resizing with discrete bottom-right size pill"
-echo "  • Live Code Preview panel with syntax highlighting (Alt+P to toggle)"
-echo "  • Shortcuts: Double-Shift (in panel), Ctrl+P / Alt+F (global)"
+if [ -n "$HERDR_BIN" ]; then
+  say "Activating personal layout in Herdr..."
+  "$HERDR_BIN" do layout.switch '{"name":"main-copy"}' 2>/dev/null || true
+  "$HERDR_BIN" do layout.select --stack panel-body --child files 2>/dev/null || true
+  "$HERDR_BIN" do layout.show --id panel 2>/dev/null || true
+fi
+
+say "✓ files-search installed successfully!"

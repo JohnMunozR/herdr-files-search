@@ -1,10 +1,12 @@
 # herdr-files-search
 
-An enhanced file browser and IntelliJ-style **Search Everywhere** mod for the [Herdr](https://github.com/herdr-app) desktop app.
+An enhanced file browser and IntelliJ-style **Search Everywhere** mod for the [Herdr](https://herdr.dev) desktop app.
 
 It extends Herdr's native `files` panel with a magnifying glass search icon in the header that launches a floating search dialog supporting multi-tab searches across files and file contents (`All`, `Files`, `Text`), fuzzy filename matching, fast live grep search, keyboard navigation, a live code preview panel, draggable title bar, and smooth resizing.
 
 ![files-search](preview.png)
+
+---
 
 ## Features
 
@@ -30,51 +32,57 @@ It extends Herdr's native `files` panel with a magnifying glass search icon in t
   - `Esc`: Close the dialog.
 - **Theme Adaptive**: Dynamically inherits theme colors (`popover`, `accent`, `raised`, `selected`, `dim`, `foreground`, `border`) from the active Herdr theme.
 
-## Quick Install
+---
 
-Run this command in your terminal:
+## Installation
+
+### Standard Herdr Method (Recommended)
+
+In Herdr, you can ask any of your coding agents (Claude, Codex, Antigravity, etc.) to install it following the Herdr standard:
+
+> **"Read ~/.config/herdr-app/AGENTS.md, then add this mod: https://github.com/JohnMunozR/herdr-files-search"**
+
+The agent will read the [`RECIPE.md`](RECIPE.md), copy `mods/files-search` to `~/.config/herdr-app/mods/files-search`, update your personal layout (`main-copy.json`), merge `keys.json`, and verify it with `herdr-app check`.
+
+---
+
+### One-line Terminal Install
+
+Run directly in your terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JohnMunozR/herdr-files-search/main/install.sh | bash
 ```
 
-Or clone the repository and run:
+Or from a local clone:
 
 ```bash
 git clone https://github.com/JohnMunozR/herdr-files-search.git
 cd herdr-files-search
-bash install.sh
+./install.sh
 ```
 
-The installer conforms to Herdr's mod documentation:
-1. Copies the mod to `~/.config/herdr-app/mods/files-search/`.
-2. Validates syntax with `herdr-app check`.
-3. Adheres to Herdr layout immutability: respects shipped layouts (`main`, `terminals`, `win98`) and creates or updates your personal layout clone (e.g. `main-copy.json`).
-4. Merges `Ctrl+P` and `Alt+F` into `~/.config/herdr-app/keys.json` without overwriting existing shortcuts.
-5. Switches Herdr live to the updated layout.
+---
 
-## Manual Installation
+### Manual Installation (Steps from AGENTS.md)
 
-Following Herdr's mod guide (`AGENTS.md`):
-
-1. **Copy the mod folder**:
+1. Clone or download this repository.
+2. Copy the `mods/files-search` folder to `~/.config/herdr-app/mods/files-search`:
    ```bash
    mkdir -p ~/.config/herdr-app/mods/files-search
    cp -r mods/files-search/* ~/.config/herdr-app/mods/files-search/
    ```
-
-2. **Verify syntax**:
-   ```bash
-   herdr-app check ~/.config/herdr-app/mods/files-search
+3. In your personal layout (`~/.config/herdr-app/layouts/main-copy.json`), point the `files` panel to `files-search`:
+   ```json
+   {
+     "id": "files",
+     "type": "block",
+     "content": {
+       "mod": "files-search"
+     }
+   }
    ```
-
-3. **Clone and update layout** (never edit shipped `main.json` directly):
-   ```bash
-   herdr-app do layout.clone '{"name":"main","as":"main-copy"}'
-   ```
-   In `~/.config/herdr-app/layouts/main-copy.json`, replace `"mod": "files"` with `"mod": "files-search"`.
-
-4. **Register shortcuts in `~/.config/herdr-app/keys.json`**:
+4. Merge shortcuts into `~/.config/herdr-app/keys.json`:
    ```json
    {
      "global": {
@@ -83,15 +91,22 @@ Following Herdr's mod guide (`AGENTS.md`):
      }
    }
    ```
-
-5. **Switch layout in Herdr**:
+5. Verify the mod:
    ```bash
-   herdr-app do layout.switch '{"name":"main-copy"}'
+   herdr-app check ~/.config/herdr-app/mods/files-search
    ```
 
-## Specification & Recipes
+---
 
-See [RECIPE.md](RECIPE.md) for the complete design specification, behavior rules, and Herdr mod architecture guidelines.
+## Uninstallation
+
+To revert back to Herdr's default `files` mod and remove shortcuts:
+
+```bash
+./install.sh --uninstall
+```
+
+---
 
 ## License
 
