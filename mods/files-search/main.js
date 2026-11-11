@@ -426,11 +426,9 @@ export default class FilesSearch extends View {
     const savedSize = shared("files-search.customSize");
     this.customWidth = savedSize?.w || null;
     this.customListHeight = savedSize?.h || null;
-    this.resizing = null;
-    this.dragStartX = 0;
-    this.dragStartY = 0;
-    this.startWidth = 0;
-    this.startListHeight = 0;
+    this.resizing = false;
+    this.lastMouseX = 0;
+    this.lastMouseY = 0;
 
     this.input = InputState.new({ placeholder: "Search everywhere by name or text (Tab to switch)..." });
     this.input.on("change", (_e, cx) => {
@@ -458,6 +456,22 @@ export default class FilesSearch extends View {
 
   closeOverlay() {
     closeOverlay(props().overlay);
+  }
+
+  adjustWindowSize(deltaW, deltaH, cx) {
+    const defaultW = this.showPreview ? 1050 : 680;
+    const minW = this.showPreview ? 920 : 600;
+    const minH = 200;
+    const maxW = 1800;
+    const maxH = 850;
+
+    const currentW = this.customWidth || defaultW;
+    const currentH = this.customListHeight || LIST_H;
+
+    this.customWidth = Math.max(minW, Math.min(maxW, currentW + deltaW));
+    this.customListHeight = Math.max(minH, Math.min(maxH, currentH + deltaH));
+    setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
+    cx.notify();
   }
 
   selectResult(item, cx) {
@@ -1052,23 +1066,41 @@ export default class FilesSearch extends View {
       .border_color(t.border)
       .bg(t.popover)
       .shadow_lg()
-      // Mouse move & up handlers for resizing
+      // If mouse leaves the overlay window, immediately cancel resizing
+      .on_hover((hovered, cx) => {
+        if (!hovered && this.resizing) {
+          this.resizing = false;
+          setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
+          cx.notify();
+        }
+      })
+      // If mouse moves while dragging corner grip
       .on_mouse_move((e, cx) => {
         if (!this.resizing) return;
-        if (this.resizing === "both" || this.resizing === "width") {
-          const dx = e.position.x - this.dragStartX;
-          this.customWidth = Math.max(minW, Math.min(maxW, this.startWidth + dx));
-        }
-        if (this.resizing === "both" || this.resizing === "height") {
-          const dy = e.position.y - this.dragStartY;
-          this.customListHeight = Math.max(minH, Math.min(maxH, this.startListHeight + dy));
-        }
+        const dx = e.position.x - this.lastMouseX;
+        const dy = e.position.y - this.lastMouseY;
+        this.lastMouseX = e.position.x;
+        this.lastMouseY = e.position.y;
+
+        // Herdr centers floating windows horizontally, so expanding the right side
+        // by dx requires adding dx * 2 to total width to keep right edge aligned with mouse
+        const nextW = (this.customWidth || defaultW) + dx * 2;
+        const nextH = (this.customListHeight || LIST_H) + dy;
+
+        this.customWidth = Math.max(minW, Math.min(maxW, nextW));
+        this.customListHeight = Math.max(minH, Math.min(maxH, nextH));
         cx.notify();
       })
       .on_mouse_up("left", (_e, cx) => {
         if (this.resizing) {
-          this.resizing = null;
+          this.resizing = false;
           setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
+          cx.notify();
+        }
+      })
+      .on_mouse_down_out((_e, cx) => {
+        if (this.resizing) {
+          this.resizing = false;
           cx.notify();
         }
       })
@@ -1096,6 +1128,21 @@ export default class FilesSearch extends View {
           this.showPreview = !this.showPreview;
           setShared("files-search.preview", this.showPreview);
           if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+        } else if ((e.control || e.alt) && (k === "=" || k === "+")) {
+          this.adjustWindowSize(120, 50, cx);
+          cx.stop_propagation();
+          return;
+        } else if ((e.control || e.alt) && (k === "-" || k === "_")) {
+          this.adjustWindowSize(-120, -50, cx);
+          cx.stop_propagation();
+          return;
+        } else if ((e.control || e.alt) && k === "0") {
+          this.customWidth = null;
+          this.customListHeight = null;
+          setShared("files-search.customSize", null);
+          cx.stop_propagation();
+          cx.notify();
+          return;
         } else if (k === "enter") {
           if (results[this.at]) this.selectResult(results[this.at], cx);
         } else return;
@@ -1188,36 +1235,71 @@ export default class FilesSearch extends View {
               .child(svg("mods/files-search/preview.svg").size(12))
               .child(div().text_size(11).font_medium().child("Preview"))
           )
-          // Maximize / Restore Toggle Button
+          // Window Size Controls: [-] [+] [ ▢ ]
           .child(
             h_flex()
-              .id("files-search-maximize-btn")
-              .size(24)
-              .rounded(5)
-              .cursor_pointer()
-              .items_center()
-              .justify_center()
-              .border_1()
-              .border_color(t.border)
+              .id("files-search-size-controls")
+              .gap(2)
+              .p(2)
+              .rounded(6)
               .bg(t.raised)
-              .text_color(t.muted)
-              .hover(s => s.text_color(t.foreground).bg(t.hover))
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .on_click((_e, cx) => {
-                const isExpanded = Boolean(this.customWidth && this.customWidth >= 1350);
-                if (isExpanded) {
-                  // Restore to normal
-                  this.customWidth = this.showPreview ? 1050 : 680;
-                  this.customListHeight = LIST_H;
-                } else {
-                  // Maximize / Expand
-                  this.customWidth = this.showPreview ? 1400 : 920;
-                  this.customListHeight = 520;
-                }
-                setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
-                cx.notify();
-              })
-              .child(svg(this.customWidth && this.customWidth >= 1350 ? "mods/files-search/restore.svg" : "mods/files-search/maximize.svg").size(12))
+              // Shrink [-]
+              .child(
+                div()
+                  .id("btn-resize-minus")
+                  .size(20)
+                  .rounded(4)
+                  .cursor_pointer()
+                  .flex()
+                  .items_center()
+                  .justify_center()
+                  .text_color(t.muted)
+                  .hover(s => s.bg(t.hover).text_color(t.foreground))
+                  .on_click((_e, cx) => this.adjustWindowSize(-120, -50, cx))
+                  .child(svg("mods/files-search/minus.svg").size(10))
+              )
+              // Enlarge [+]
+              .child(
+                div()
+                  .id("btn-resize-plus")
+                  .size(20)
+                  .rounded(4)
+                  .cursor_pointer()
+                  .flex()
+                  .items_center()
+                  .justify_center()
+                  .text_color(t.muted)
+                  .hover(s => s.bg(t.hover).text_color(t.foreground))
+                  .on_click((_e, cx) => this.adjustWindowSize(120, 50, cx))
+                  .child(svg("mods/files-search/plus.svg").size(10))
+              )
+              // Maximize / Restore [ ▢ ]
+              .child(
+                div()
+                  .id("btn-resize-max")
+                  .size(20)
+                  .rounded(4)
+                  .cursor_pointer()
+                  .flex()
+                  .items_center()
+                  .justify_center()
+                  .text_color(t.muted)
+                  .hover(s => s.text_color(t.foreground).bg(t.hover))
+                  .on_click((_e, cx) => {
+                    const isExpanded = Boolean(this.customWidth && this.customWidth >= 1350);
+                    if (isExpanded) {
+                      this.customWidth = this.showPreview ? 1050 : 680;
+                      this.customListHeight = LIST_H;
+                    } else {
+                      this.customWidth = this.showPreview ? 1420 : 920;
+                      this.customListHeight = 520;
+                    }
+                    setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
+                    cx.notify();
+                  })
+                  .child(svg(this.customWidth && this.customWidth >= 1350 ? "mods/files-search/restore.svg" : "mods/files-search/maximize.svg").size(11))
+              )
           )
           .child(
             h_flex()
@@ -1312,41 +1394,6 @@ export default class FilesSearch extends View {
             el.child(this.renderPreviewPane(t, results[this.at], cx, listH, previewW))
           )
       )
-      // Resize handle grips:
-      // Right edge resize handle
-      .child(
-        div()
-          .id("resize-edge-e")
-          .absolute()
-          .right(0)
-          .top(36)
-          .bottom(14)
-          .w(6)
-          .cursor_ew_resize()
-          .on_mouse_down("left", (e, cx) => {
-            this.resizing = "width";
-            this.dragStartX = e.position.x;
-            this.startWidth = winW;
-            cx.stop_propagation();
-          })
-      )
-      // Bottom edge resize handle
-      .child(
-        div()
-          .id("resize-edge-s")
-          .absolute()
-          .left(16)
-          .right(16)
-          .bottom(0)
-          .h(6)
-          .cursor_ns_resize()
-          .on_mouse_down("left", (e, cx) => {
-            this.resizing = "height";
-            this.dragStartY = e.position.y;
-            this.startListHeight = listH;
-            cx.stop_propagation();
-          })
-      )
       // Bottom-right corner grip handle
       .child(
         div()
@@ -1354,7 +1401,7 @@ export default class FilesSearch extends View {
           .absolute()
           .right(2)
           .bottom(2)
-          .size(16)
+          .size(18)
           .cursor_nwse_resize()
           .flex()
           .items_center()
@@ -1362,14 +1409,12 @@ export default class FilesSearch extends View {
           .text_color(t.dim)
           .hover(s => s.text_color(t.foreground))
           .on_mouse_down("left", (e, cx) => {
-            this.resizing = "both";
-            this.dragStartX = e.position.x;
-            this.dragStartY = e.position.y;
-            this.startWidth = winW;
-            this.startListHeight = listH;
+            this.resizing = true;
+            this.lastMouseX = e.position.x;
+            this.lastMouseY = e.position.y;
             cx.stop_propagation();
           })
-          .child(svg("mods/files-search/grip.svg").size(10))
+          .child(svg("mods/files-search/grip.svg").size(11))
       );
   }
 
