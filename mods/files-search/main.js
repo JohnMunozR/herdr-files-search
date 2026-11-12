@@ -38,6 +38,57 @@ async function directory(path, on) {
   return out;
 }
 
+const CHUNK_SIZE = 120;
+
+// Cross-platform lazy line range reader (Linux, macOS, Windows)
+async function readFileChunk(fullPath, startLine, count, on) {
+  const isWindows = !on && window()?.platform === "windows";
+  if (isWindows) {
+    try {
+      const escaped = fullPath.replace(/'/g, "''");
+      const cmd = startLine <= 1
+        ? `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-Content -LiteralPath '${escaped}' -TotalCount ${count}`
+        : `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-Content -LiteralPath '${escaped}' | Select-Object -Skip ${startLine - 1} -First ${count}`;
+      const res = await exec("powershell", ["-NoProfile", "-Command", cmd], { on }).catch(() => null);
+      if (res && res.code === 0 && typeof res.stdout === "string") {
+        if (res.stdout.includes("\0")) return "binary";
+        const raw = res.stdout.replace(/\r\n/g, "\n");
+        const lines = raw.split("\n");
+        if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+        return lines;
+      }
+    } catch {}
+  } else {
+    // Linux and macOS (standard POSIX tools)
+    try {
+      let res;
+      if (startLine <= 1) {
+        res = await exec("head", ["-n", String(count), fullPath], { on }).catch(() => null);
+      } else {
+        const endLine = startLine + count - 1;
+        res = await exec("sed", ["-n", `${startLine},${endLine}p`, fullPath], { on }).catch(() => null);
+      }
+      if (res && res.code === 0 && typeof res.stdout === "string") {
+        if (res.stdout.includes("\0")) return "binary";
+        const lines = res.stdout.split("\n");
+        if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+        return lines;
+      }
+    } catch {}
+  }
+
+  // Universal fallback via readTextFile
+  try {
+    const text = await readTextFile(fullPath, { on }).catch(() => null);
+    if (text === null) return null;
+    if (text.includes("\0")) return "binary";
+    const allLines = text.split("\n");
+    return allLines.slice(startLine - 1, startLine - 1 + count);
+  } catch {
+    return null;
+  }
+}
+
 // Fuzzy score and hit indices for file matching
 function fuzzy(q, text) {
   const t = text.toLowerCase();
@@ -424,11 +475,13 @@ export default class FilesSearch extends View {
     this.showPreview = savedPreview !== null && savedPreview !== undefined ? Boolean(savedPreview) : true;
     this.previewItem = null;
     this.previewLines = [];
+    this.previewStartLine = 1;
+    this.previewHasMore = false;
     this.previewLoading = false;
+    this.previewLoadingMore = false;
     this.previewError = null;
     this.previewScroll = 0;
     this.previewCache = new Map();
-    this.previewEditorState = null;
 
     // Resize state (remembers user size preference)
     const savedSize = shared("files-search.customSize");
@@ -448,7 +501,7 @@ export default class FilesSearch extends View {
       this.triggerTextSearch(cx);
       if (this.showPreview) {
         const items = this.searchResults();
-        this.updatePreview(items[0], cx, false);
+        this.schedulePreview(items[0], cx, false);
       }
       cx.notify();
     });
@@ -471,8 +524,6 @@ export default class FilesSearch extends View {
     this.previewDebounceTask = null;
     this.code?.release();
     this.code = null;
-    this.previewEditorState?.release();
-    this.previewEditorState = null;
   }
 
   closeOverlay() {
@@ -480,8 +531,6 @@ export default class FilesSearch extends View {
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
     this.previewDebounceTask = null;
-    this.previewEditorState?.release();
-    this.previewEditorState = null;
     closeOverlay(props().overlay);
   }
 
@@ -539,130 +588,96 @@ export default class FilesSearch extends View {
     cx.notify();
   }
 
-  setPreviewEditor(text, targetPath) {
-    this.previewEditorState?.release();
-    this.previewEditorState = null;
-    if (!text) return;
-    const t = theme(), ext = targetPath.includes(".") ? targetPath.split(".").pop().toLowerCase() : "txt";
-    const mappedLang = LANG[ext] ?? ext;
-    try {
-      this.previewEditorState = EditorState.new({
-        language: mappedLang,
-        readonly: true,
-        value: text,
-        font_family: settings()?.font_family,
-        font_size: 11.5,
-        syntax: {
-          keyword: t.ansi5,
-          string: t.ansi2,
-          comment: t.dim,
-          function: t.ansi4,
-          type: t.ansi3,
-          number: t.ansi1,
-          constant: t.ansi6,
-        },
-      });
-    } catch {
-      // If language tree-sitter grammar fails or is unsupported, fallback to plain text editor
-      try {
-        this.previewEditorState = EditorState.new({
-          readonly: true,
-          value: text,
-          font_family: settings()?.font_family,
-          font_size: 11.5,
-        });
-      } catch {
-        this.previewEditorState = null;
-      }
-    }
-  }
-
-  updatePreview(item, cx, immediate = false) {
+  schedulePreview(item, cx, immediate = false) {
     if (!item) {
       this.previewItem = null;
       this.previewLines = [];
-      this.previewError = null;
+      this.previewStartLine = 1;
+      this.previewHasMore = false;
       this.previewLoading = false;
+      this.previewLoadingMore = false;
+      this.previewError = null;
       this._currentPreviewKey = null;
-      this.previewEditorState?.release();
-      this.previewEditorState = null;
       return;
     }
 
     const itemKey = `${item.path}:${item.line || 0}`;
-    if (this._currentPreviewKey === itemKey && (this.previewEditorState || this.previewLines.length > 0 || this.previewError)) {
+    if (this._currentPreviewKey === itemKey && (this.previewLines.length > 0 || this.previewError)) {
       return;
     }
     this._currentPreviewKey = itemKey;
     this.previewItem = item;
 
     // Check memory cache first
-    const cached = this.previewCache.get(item.path);
-    if (cached !== undefined) {
-      if (this.previewDebounceTask) {
-        this.previewDebounceTask.cancel();
-        this.previewDebounceTask = null;
-      }
+    const cached = this.previewCache.get(itemKey);
+    if (cached) {
+      this.previewDebounceTask?.cancel();
+      this.previewDebounceTask = null;
       this.previewLines = cached.lines;
+      this.previewStartLine = cached.startLine;
+      this.previewHasMore = cached.hasMore;
       this.previewError = null;
       this.previewLoading = false;
-      this.setPreviewEditor(cached.text, item.path);
-      if (item.kind === "text" && item.line) {
-        this.previewScroll = Math.max(0, item.line - 6);
-      } else {
-        this.previewScroll = 0;
-      }
+      this.previewLoadingMore = false;
+      this.previewScroll = cached.scroll;
       return;
     }
 
-    // Not cached: need to read from disk
     this.previewLoading = true;
     this.previewError = null;
-    this.previewLines = [];
-    this.previewEditorState?.release();
-    this.previewEditorState = null;
-
-    const reqSeq = ++this.previewReqSeq;
-    const root = this.searchRoot;
-    const on = this.searchOn;
-    const targetPath = item.path;
 
     if (this.previewDebounceTask) {
       this.previewDebounceTask.cancel();
       this.previewDebounceTask = null;
     }
 
-    const loadAction = (asyncCx) => {
+    const reqSeq = ++this.previewReqSeq;
+    const root = this.searchRoot;
+    const on = this.searchOn;
+    const targetPath = item.path;
+    const targetLine = item.kind === "text" && item.line ? item.line : null;
+    const startLine = targetLine ? Math.max(1, targetLine - 20) : 1;
+
+    const fetchAction = (asyncCx) => {
       asyncCx.spawn(async cx => {
         try {
           const fullPath = `${root}/${targetPath}`;
-          const text = await readTextFile(fullPath, { on });
+          const lines = await readFileChunk(fullPath, startLine, CHUNK_SIZE, on);
           if (reqSeq !== this.previewReqSeq) return;
-          if (text === null) {
+          if (lines === null) {
             this.previewError = "File not found or unreadable";
+            this.previewLines = [];
             return;
           }
-          if (text.includes("\0")) {
+          if (lines === "binary") {
             this.previewError = "Binary file · no text preview";
+            this.previewLines = [];
             return;
           }
-          const clean = text.length > 250000 ? text.slice(0, 250000) : text;
-          const lines = clean.split("\n");
+
+          this.previewLines = lines;
+          this.previewStartLine = startLine;
+          this.previewHasMore = lines.length >= CHUNK_SIZE;
+          if (targetLine) {
+            this.previewScroll = Math.max(0, targetLine - startLine - 6);
+          } else {
+            this.previewScroll = 0;
+          }
+
           if (this.previewCache.size > 80) {
             const firstKey = this.previewCache.keys().next().value;
             this.previewCache.delete(firstKey);
           }
-          this.previewCache.set(targetPath, { lines, text: clean });
-          this.previewLines = lines;
-          this.setPreviewEditor(clean, targetPath);
-          if (item.kind === "text" && item.line) {
-            this.previewScroll = Math.max(0, item.line - 6);
-          } else {
-            this.previewScroll = 0;
-          }
+          this.previewCache.set(itemKey, {
+            lines: [...lines],
+            startLine,
+            hasMore: this.previewHasMore,
+            scroll: this.previewScroll,
+          });
         } catch {
           if (reqSeq === this.previewReqSeq) {
             this.previewError = "Cannot preview this file";
+            this.previewLines = [];
           }
         } finally {
           if (reqSeq === this.previewReqSeq) {
@@ -674,10 +689,52 @@ export default class FilesSearch extends View {
     };
 
     if (immediate) {
-      loadAction(cx);
+      fetchAction(cx);
     } else {
-      this.previewDebounceTask = cx.timer.after(70, cx => loadAction(cx));
+      this.previewDebounceTask = cx.timer.after(90, cx => fetchAction(cx));
     }
+  }
+
+  loadNextPreviewChunk(cx) {
+    if (!this.previewItem || !this.previewHasMore || this.previewLoadingMore || this.previewLoading) return;
+    this.previewLoadingMore = true;
+
+    const reqSeq = this.previewReqSeq;
+    const root = this.searchRoot;
+    const on = this.searchOn;
+    const targetPath = this.previewItem.path;
+    const itemKey = `${this.previewItem.path}:${this.previewItem.line || 0}`;
+    const nextStartLine = this.previewStartLine + this.previewLines.length;
+
+    cx.spawn(async cx => {
+      try {
+        const fullPath = `${root}/${targetPath}`;
+        const newLines = await readFileChunk(fullPath, nextStartLine, CHUNK_SIZE, on);
+        if (reqSeq !== this.previewReqSeq) return;
+        if (Array.isArray(newLines) && newLines.length > 0) {
+          this.previewLines = this.previewLines.concat(newLines);
+          this.previewHasMore = newLines.length >= CHUNK_SIZE;
+          const cached = this.previewCache.get(itemKey);
+          if (cached) {
+            cached.lines = this.previewLines;
+            cached.hasMore = this.previewHasMore;
+          }
+        } else {
+          this.previewHasMore = false;
+        }
+      } catch {
+        this.previewHasMore = false;
+      } finally {
+        if (reqSeq === this.previewReqSeq) {
+          this.previewLoadingMore = false;
+          cx.notify();
+        }
+      }
+    });
+  }
+
+  updatePreview(item, cx, immediate = false) {
+    this.schedulePreview(item, cx, immediate);
   }
 
   async loadWorkspaceFiles(cx) {
@@ -1122,7 +1179,7 @@ export default class FilesSearch extends View {
     const endIdx = Math.min(this.previewLines.length, startIdx + VISIBLE_ROWS);
 
     for (let i = startIdx; i < endIdx; i++) {
-      const lineNum = i + 1;
+      const lineNum = (this.previewStartLine || 1) + i;
       const isTarget = lineNum === targetLine;
       const lineContent = this.previewLines[i] ?? "";
 
@@ -1205,7 +1262,25 @@ export default class FilesSearch extends View {
             )
           )
           .when(!targetLine && this.previewLines.length > 0, el =>
-            el.child(div().text_size(11).text_color(t.dim).child(`${this.previewLines.length} lines`))
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.dim)
+                .child(`${this.previewLines.length}${this.previewHasMore ? "+" : ""} lines`)
+            )
+          )
+          .when(Boolean(this.previewLoadingMore), el =>
+            el.child(
+              div()
+                .px(5)
+                .py(1)
+                .rounded(3)
+                .bg(t.selected)
+                .text_size(10.5)
+                .font_medium()
+                .text_color(t.ansi4)
+                .child("loading more…")
+            )
           )
           .child(
             div()
@@ -1229,37 +1304,31 @@ export default class FilesSearch extends View {
           .flex_1()
           .min_h(0)
           .overflow_hidden()
-          .when(this.previewLoading, el =>
+          .when(this.previewLoading && this.previewLines.length === 0, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Loading preview…"))
           )
-          .when(!this.previewLoading && Boolean(this.previewError), el =>
+          .when(!this.previewLoading && Boolean(this.previewError) && this.previewLines.length === 0, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child(this.previewError))
           )
-          .when(!this.previewLoading && !this.previewError && !targetLine, el =>
-            el.child(
-              this.previewEditorState
-                ? Editor.new(this.previewEditorState).flex_1().min_h(0)
-                : v_flex()
-                    .flex_1()
-                    .min_h(0)
-                    .py(4)
-                    .on_scroll_wheel((e, cx) => {
-                      const delta = e.delta.y > 0 ? -3 : 3;
-                      this.previewScroll = Math.max(0, Math.min(maxScroll, this.previewScroll + delta));
-                      cx.notify();
-                    })
-                    .children(visibleLines.length > 0 ? visibleLines : [div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file")])
-            )
-          )
-          .when(!this.previewLoading && !this.previewError && Boolean(targetLine), el =>
+          .when(this.previewLines.length > 0, el =>
             el
               .py(4)
               .on_scroll_wheel((e, cx) => {
                 const delta = e.delta.y > 0 ? -3 : 3;
-                this.previewScroll = Math.max(0, Math.min(maxScroll, this.previewScroll + delta));
+                this.previewScroll = Math.max(0, this.previewScroll + delta);
+                if (this.previewHasMore && !this.previewLoadingMore) {
+                  if (this.previewScroll + VISIBLE_ROWS >= this.previewLines.length - 15) {
+                    this.loadNextPreviewChunk(cx);
+                  }
+                }
+                const max = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
+                this.previewScroll = Math.min(this.previewScroll, max);
                 cx.notify();
               })
-              .children(visibleLines.length > 0 ? visibleLines : [div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file")])
+              .children(visibleLines)
+          )
+          .when(!this.previewLoading && !this.previewError && this.previewLines.length === 0, el =>
+            el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file"))
           )
       );
   }
@@ -1270,8 +1339,9 @@ export default class FilesSearch extends View {
     this.at = Math.min(this.at, Math.max(0, results.length - 1));
     const currentItem = results[this.at];
     if (this.showPreview && currentItem) {
-      if (!this.previewItem || this.previewItem.path !== currentItem.path || this.previewItem.line !== currentItem.line) {
-        this.updatePreview(currentItem, cx, false);
+      const itemKey = `${currentItem.path}:${currentItem.line || 0}`;
+      if (this._currentPreviewKey !== itemKey) {
+        this.schedulePreview(currentItem, cx, false);
       }
     }
 
