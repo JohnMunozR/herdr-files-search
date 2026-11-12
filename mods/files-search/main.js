@@ -421,6 +421,7 @@ export default class FilesSearch extends View {
     this.previewError = null;
     this.previewScroll = 0;
     this.previewCache = new Map();
+    this.previewEditorState = null;
 
     // Resize state (remembers user size preference)
     const savedSize = shared("files-search.customSize");
@@ -454,7 +455,16 @@ export default class FilesSearch extends View {
     this.loadWorkspaceFiles(cx);
   }
 
+  close(cx) {
+    this.code?.release();
+    this.code = null;
+    this.previewEditorState?.release();
+    this.previewEditorState = null;
+  }
+
   closeOverlay() {
+    this.previewEditorState?.release();
+    this.previewEditorState = null;
     closeOverlay(props().overlay);
   }
 
@@ -512,20 +522,48 @@ export default class FilesSearch extends View {
     cx.notify();
   }
 
+  setPreviewEditor(text, targetPath) {
+    this.previewEditorState?.release();
+    this.previewEditorState = null;
+    if (!text) return;
+    const t = theme(), ext = targetPath.includes(".") ? targetPath.split(".").pop().toLowerCase() : "txt";
+    try {
+      this.previewEditorState = EditorState.new({
+        language: LANG[ext] ?? ext,
+        readonly: true,
+        value: text,
+        font_family: settings()?.font_family,
+        font_size: 11.5,
+        syntax: {
+          keyword: t.ansi5,
+          string: t.ansi2,
+          comment: t.dim,
+          function: t.ansi4,
+          type: t.ansi3,
+          number: t.ansi1,
+          constant: t.ansi6,
+        },
+      });
+    } catch {}
+  }
+
   updatePreview(item, cx) {
     if (!item) {
       this.previewItem = null;
       this.previewLines = [];
       this.previewError = null;
       this.previewLoading = false;
+      this.previewEditorState?.release();
+      this.previewEditorState = null;
       return;
     }
     this.previewItem = item;
     const cached = this.previewCache.get(item.path);
     if (cached !== undefined) {
-      this.previewLines = cached;
+      this.previewLines = cached.lines;
       this.previewError = null;
       this.previewLoading = false;
+      this.setPreviewEditor(cached.text, item.path);
       if (item.kind === "text" && item.line) {
         this.previewScroll = Math.max(0, item.line - 6);
       } else {
@@ -537,6 +575,8 @@ export default class FilesSearch extends View {
     this.previewLoading = true;
     this.previewError = null;
     this.previewLines = [];
+    this.previewEditorState?.release();
+    this.previewEditorState = null;
 
     const root = this.searchRoot;
     const on = this.searchOn;
@@ -557,8 +597,9 @@ export default class FilesSearch extends View {
         }
         const clean = text.length > 400000 ? text.slice(0, 400000) : text;
         const lines = clean.split("\n");
-        this.previewCache.set(targetPath, lines);
+        this.previewCache.set(targetPath, { lines, text: clean });
         this.previewLines = lines;
+        this.setPreviewEditor(clean, targetPath);
         if (item.kind === "text" && item.line) {
           this.previewScroll = Math.max(0, item.line - 6);
         } else {
@@ -786,6 +827,90 @@ export default class FilesSearch extends View {
       .child(div().text_color(t.dim).child(after.replace(/ /g, "\u00a0")));
   }
 
+  renderSyntaxLine(t, text, ext, query, isTarget) {
+    if (!text) return div().child("\u00a0");
+    const clean = text.replace(/\t/g, "    ");
+
+    const tokenRegex = /(\/\/.*$|#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\b(?:class|public|private|protected|static|final|abstract|interface|extends|implements|import|package|return|new|this|super|if|else|for|while|do|switch|case|default|break|continue|try|catch|finally|throw|throws|void|int|long|short|byte|float|double|boolean|char|const|let|var|function|def|fn|async|await|export|from|as|type|struct|impl|trait|pub|mut|match|enum|select|defer|go)\b|\b[a-zA-Z_$][a-zA-Z0-9_$]*(?=\s*\()|\b[A-Z][a-zA-Z0-9_]*\b|\b(?:true|false|null|nil|None|undefined|[A-Z0-9_]{2,})\b|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b)/g;
+
+    const spans = [];
+    let lastIndex = 0;
+    let match;
+    const lowerQ = query ? query.toLowerCase() : "";
+
+    const addTextChunk = (str, color, isBold = false) => {
+      if (!str) return;
+      if (lowerQ && str.toLowerCase().includes(lowerQ)) {
+        const lowerStr = str.toLowerCase();
+        let cur = 0;
+        let qIdx = lowerStr.indexOf(lowerQ, cur);
+        while (qIdx !== -1) {
+          if (qIdx > cur) {
+            spans.push({ text: str.slice(cur, qIdx), color, bold: isBold });
+          }
+          spans.push({ text: str.slice(qIdx, qIdx + query.length), color: t.background, bold: true, bg: t.accent });
+          cur = qIdx + query.length;
+          qIdx = lowerStr.indexOf(lowerQ, cur);
+        }
+        if (cur < str.length) {
+          spans.push({ text: str.slice(cur), color, bold: isBold });
+        }
+      } else {
+        spans.push({ text: str, color, bold: isBold });
+      }
+    };
+
+    while ((match = tokenRegex.exec(clean)) !== null) {
+      if (match.index > lastIndex) {
+        addTextChunk(clean.slice(lastIndex, match.index), isTarget ? t.foreground : t.muted);
+      }
+      const tok = match[0];
+      let color = isTarget ? t.foreground : t.muted;
+      let bold = false;
+
+      if (tok.startsWith("//") || tok.startsWith("#")) {
+        color = t.dim;
+      } else if (tok.startsWith('"') || tok.startsWith("'") || tok.startsWith("`")) {
+        color = t.ansi2;
+      } else if (/^\d/.test(tok) || tok.startsWith("0x")) {
+        color = t.ansi1;
+      } else if (/^(true|false|null|nil|None|undefined)$/.test(tok) || (tok.length > 1 && tok === tok.toUpperCase() && /^[A-Z0-9_]+$/.test(tok))) {
+        color = t.ansi6;
+      } else if (/^(class|public|private|protected|static|final|abstract|interface|extends|implements|import|package|return|new|this|super|if|else|for|while|do|switch|case|default|break|continue|try|catch|finally|throw|throws|void|int|long|short|byte|float|double|boolean|char|const|let|var|function|def|fn|async|await|export|from|as|type|struct|impl|trait|pub|mut|match|enum|select|defer|go)$/.test(tok)) {
+        color = t.ansi5;
+        bold = true;
+      } else if (/^[A-Z]/.test(tok)) {
+        color = t.ansi3;
+      } else {
+        color = t.ansi4;
+      }
+
+      addTextChunk(tok, color, bold);
+      lastIndex = tokenRegex.lastIndex;
+    }
+
+    if (lastIndex < clean.length) {
+      addTextChunk(clean.slice(lastIndex), isTarget ? t.foreground : t.muted);
+    }
+
+    if (spans.length === 0) {
+      return div().child(clean ? clean.replace(/ /g, "\u00a0") : "\u00a0");
+    }
+
+    const row = h_flex().items_center();
+    spans.forEach((s) => {
+      const el = div()
+        .text_size(11.5)
+        .font_family(settings()?.font_family || "monospace")
+        .text_color(s.color)
+        .when(Boolean(s.bold), d => d.font_semibold())
+        .when(Boolean(s.bg), d => d.bg(s.bg).rounded(2).px(2))
+        .child(s.text.replace(/ /g, "\u00a0"));
+      row.child(el);
+    });
+    return row;
+  }
+
   renderHighlightedCodeLine(t, text, query) {
     if (!text || !query) return div().child(text ? text.replace(/\t/g, "    ").replace(/ /g, "\u00a0") : "\u00a0");
     const clean = text.replace(/\t/g, "    ");
@@ -831,6 +956,7 @@ export default class FilesSearch extends View {
     const targetLine = isTextMatch ? item.line : null;
     const fileName = item.path.split("/").pop() || item.path;
     const dirPath = item.path.includes("/") ? item.path.slice(0, item.path.lastIndexOf("/")) : "";
+    const ext = item.path.includes(".") ? item.path.split(".").pop().toLowerCase() : "";
 
     const LINE_H = 21;
     const VISIBLE_ROWS = Math.max(5, Math.floor((listH + 12) / LINE_H));
@@ -870,21 +996,13 @@ export default class FilesSearch extends View {
               .when(isTarget, el => el.font_semibold())
               .child(String(lineNum))
           )
-          // Line Content
+          // Line Content with Syntax Highlighting
           .child(
             div()
               .flex_1()
               .min_w(0)
               .truncate()
-              .text_size(11.5)
-              .font_family(settings()?.font_family || "monospace")
-              .text_color(isTarget ? t.foreground : t.muted)
-              .when(isTarget && item.matchedQuery, el =>
-                el.child(this.renderHighlightedCodeLine(t, lineContent, item.matchedQuery))
-              )
-              .when(!isTarget || !item.matchedQuery, el =>
-                el.child(lineContent ? lineContent.replace(/\t/g, "    ").replace(/ /g, "\u00a0") : "\u00a0")
-              )
+              .child(this.renderSyntaxLine(t, lineContent, ext, isTarget ? item.matchedQuery : null, isTarget))
           )
       );
     }
@@ -957,23 +1075,28 @@ export default class FilesSearch extends View {
           .flex_1()
           .min_h(0)
           .overflow_hidden()
-          .py(4)
-          .on_scroll_wheel((e, cx) => {
-            const delta = e.delta.y > 0 ? -3 : 3;
-            this.previewScroll = Math.max(0, Math.min(maxScroll, this.previewScroll + delta));
-            cx.notify();
-          })
           .when(this.previewLoading, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Loading preview…"))
           )
           .when(!this.previewLoading && Boolean(this.previewError), el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child(this.previewError))
           )
-          .when(!this.previewLoading && !this.previewError && visibleLines.length === 0, el =>
-            el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file"))
+          .when(!this.previewLoading && !this.previewError && !targetLine, el =>
+            el.child(
+              this.previewEditorState
+                ? Editor.new(this.previewEditorState).flex_1().min_h(0)
+                : div().p(20).text_center().text_size(12).text_color(t.dim).child(visibleLines.length === 0 ? "Empty file" : "Loading preview…")
+            )
           )
-          .when(!this.previewLoading && !this.previewError && visibleLines.length > 0, el =>
-            el.children(visibleLines)
+          .when(!this.previewLoading && !this.previewError && Boolean(targetLine), el =>
+            el
+              .py(4)
+              .on_scroll_wheel((e, cx) => {
+                const delta = e.delta.y > 0 ? -3 : 3;
+                this.previewScroll = Math.max(0, Math.min(maxScroll, this.previewScroll + delta));
+                cx.notify();
+              })
+              .children(visibleLines.length > 0 ? visibleLines : [div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file")])
           )
       );
   }
