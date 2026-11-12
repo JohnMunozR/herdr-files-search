@@ -408,6 +408,13 @@ export default class FilesSearch extends View {
     this.textResults = [];
     this.isSearchingText = false;
     this.searchSeq = 0;
+    this.previewReqSeq = 0;
+    this.textSearchTask = null;
+    this.previewDebounceTask = null;
+    this.fileEntries = [];
+    this._cachedResults = null;
+    this._lastSearchKey = null;
+    this._currentPreviewKey = null;
     this.at = 0;
     this.scroll = 0;
     this.handle = cx.focus_handle();
@@ -436,10 +443,12 @@ export default class FilesSearch extends View {
       this.query = this.input.value();
       this.at = 0;
       this.scroll = 0;
+      this._lastSearchKey = null;
+      this._cachedResults = null;
       this.triggerTextSearch(cx);
       if (this.showPreview) {
         const items = this.searchResults();
-        this.updatePreview(items[0], cx);
+        this.updatePreview(items[0], cx, false);
       }
       cx.notify();
     });
@@ -456,6 +465,10 @@ export default class FilesSearch extends View {
   }
 
   close(cx) {
+    this.textSearchTask?.cancel();
+    this.textSearchTask = null;
+    this.previewDebounceTask?.cancel();
+    this.previewDebounceTask = null;
     this.code?.release();
     this.code = null;
     this.previewEditorState?.release();
@@ -463,6 +476,10 @@ export default class FilesSearch extends View {
   }
 
   closeOverlay() {
+    this.textSearchTask?.cancel();
+    this.textSearchTask = null;
+    this.previewDebounceTask?.cancel();
+    this.previewDebounceTask = null;
     this.previewEditorState?.release();
     this.previewEditorState = null;
     closeOverlay(props().overlay);
@@ -527,9 +544,10 @@ export default class FilesSearch extends View {
     this.previewEditorState = null;
     if (!text) return;
     const t = theme(), ext = targetPath.includes(".") ? targetPath.split(".").pop().toLowerCase() : "txt";
+    const mappedLang = LANG[ext] ?? ext;
     try {
       this.previewEditorState = EditorState.new({
-        language: LANG[ext] ?? ext,
+        language: mappedLang,
         readonly: true,
         value: text,
         font_family: settings()?.font_family,
@@ -544,22 +562,47 @@ export default class FilesSearch extends View {
           constant: t.ansi6,
         },
       });
-    } catch {}
+    } catch {
+      // If language tree-sitter grammar fails or is unsupported, fallback to plain text editor
+      try {
+        this.previewEditorState = EditorState.new({
+          readonly: true,
+          value: text,
+          font_family: settings()?.font_family,
+          font_size: 11.5,
+        });
+      } catch {
+        this.previewEditorState = null;
+      }
+    }
   }
 
-  updatePreview(item, cx) {
+  updatePreview(item, cx, immediate = false) {
     if (!item) {
       this.previewItem = null;
       this.previewLines = [];
       this.previewError = null;
       this.previewLoading = false;
+      this._currentPreviewKey = null;
       this.previewEditorState?.release();
       this.previewEditorState = null;
       return;
     }
+
+    const itemKey = `${item.path}:${item.line || 0}`;
+    if (this._currentPreviewKey === itemKey && (this.previewEditorState || this.previewLines.length > 0 || this.previewError)) {
+      return;
+    }
+    this._currentPreviewKey = itemKey;
     this.previewItem = item;
+
+    // Check memory cache first
     const cached = this.previewCache.get(item.path);
     if (cached !== undefined) {
+      if (this.previewDebounceTask) {
+        this.previewDebounceTask.cancel();
+        this.previewDebounceTask = null;
+      }
       this.previewLines = cached.lines;
       this.previewError = null;
       this.previewLoading = false;
@@ -572,50 +615,69 @@ export default class FilesSearch extends View {
       return;
     }
 
+    // Not cached: need to read from disk
     this.previewLoading = true;
     this.previewError = null;
     this.previewLines = [];
     this.previewEditorState?.release();
     this.previewEditorState = null;
 
+    const reqSeq = ++this.previewReqSeq;
     const root = this.searchRoot;
     const on = this.searchOn;
     const targetPath = item.path;
 
-    cx.spawn(async cx => {
-      try {
-        const fullPath = `${root}/${targetPath}`;
-        const text = await readTextFile(fullPath, { on });
-        if (this.previewItem?.path !== targetPath) return;
-        if (text === null) {
-          this.previewError = "File not found";
-          return;
+    if (this.previewDebounceTask) {
+      this.previewDebounceTask.cancel();
+      this.previewDebounceTask = null;
+    }
+
+    const loadAction = (asyncCx) => {
+      asyncCx.spawn(async cx => {
+        try {
+          const fullPath = `${root}/${targetPath}`;
+          const text = await readTextFile(fullPath, { on });
+          if (reqSeq !== this.previewReqSeq) return;
+          if (text === null) {
+            this.previewError = "File not found or unreadable";
+            return;
+          }
+          if (text.includes("\0")) {
+            this.previewError = "Binary file · no text preview";
+            return;
+          }
+          const clean = text.length > 250000 ? text.slice(0, 250000) : text;
+          const lines = clean.split("\n");
+          if (this.previewCache.size > 80) {
+            const firstKey = this.previewCache.keys().next().value;
+            this.previewCache.delete(firstKey);
+          }
+          this.previewCache.set(targetPath, { lines, text: clean });
+          this.previewLines = lines;
+          this.setPreviewEditor(clean, targetPath);
+          if (item.kind === "text" && item.line) {
+            this.previewScroll = Math.max(0, item.line - 6);
+          } else {
+            this.previewScroll = 0;
+          }
+        } catch {
+          if (reqSeq === this.previewReqSeq) {
+            this.previewError = "Cannot preview this file";
+          }
+        } finally {
+          if (reqSeq === this.previewReqSeq) {
+            this.previewLoading = false;
+            cx.notify();
+          }
         }
-        if (text.includes("\0")) {
-          this.previewError = "Binary file · no text preview";
-          return;
-        }
-        const clean = text.length > 400000 ? text.slice(0, 400000) : text;
-        const lines = clean.split("\n");
-        this.previewCache.set(targetPath, { lines, text: clean });
-        this.previewLines = lines;
-        this.setPreviewEditor(clean, targetPath);
-        if (item.kind === "text" && item.line) {
-          this.previewScroll = Math.max(0, item.line - 6);
-        } else {
-          this.previewScroll = 0;
-        }
-      } catch (err) {
-        if (this.previewItem?.path === targetPath) {
-          this.previewError = "Cannot preview this file";
-        }
-      } finally {
-        if (this.previewItem?.path === targetPath) {
-          this.previewLoading = false;
-          cx.notify();
-        }
-      }
-    });
+      });
+    };
+
+    if (immediate) {
+      loadAction(cx);
+    } else {
+      this.previewDebounceTask = cx.timer.after(70, cx => loadAction(cx));
+    }
   }
 
   async loadWorkspaceFiles(cx) {
@@ -626,8 +688,8 @@ export default class FilesSearch extends View {
     cx.spawn(async cx => {
       try {
         let list = [];
-        // Script that lists all workspace files with no depth truncation
-        const script = 'if command -v rg >/dev/null 2>&1; then rg --files --hidden --glob "!.git" 2>/dev/null; elif git rev-parse --show-toplevel >/dev/null 2>&1; then git ls-files --cached --others --exclude-standard; else find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -type f | sed "s|^./||"; fi';
+        // Script that lists all workspace files with no depth truncation, ignoring heavy caches
+        const script = 'if command -v rg >/dev/null 2>&1; then rg --files --hidden --glob "!.git" --glob "!node_modules" --glob "!.cache" --glob "!target" --glob "!build" --glob "!.next" --glob "!.venv" --glob "!vendor" 2>/dev/null; elif git rev-parse --show-toplevel >/dev/null 2>&1; then git ls-files --cached --others --exclude-standard; else find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -type f | sed "s|^./||"; fi';
         const res = await exec("sh", ["-c", script], { cwd: root, on }).catch(() => null);
         if (res?.code === 0 && res.stdout.trim()) {
           list = res.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
@@ -637,15 +699,28 @@ export default class FilesSearch extends View {
           if (gitRes?.code === 0 && gitRes.stdout.trim()) {
             list = gitRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
           } else {
-            const rgRes = await exec("rg", ["--files", "--hidden", "--glob", "!.git"], { cwd: root, on }).catch(() => null);
+            const rgRes = await exec("rg", ["--files", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--glob", "!target", "--glob", "!build"], { cwd: root, on }).catch(() => null);
             if (rgRes?.code === 0 && rgRes.stdout.trim()) {
               list = rgRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
             }
           }
         }
-        this.fileList = list.slice(0, 15000);
+        const sliced = list.slice(0, 20000);
+        this.fileList = sliced;
+        this.fileEntries = sliced.map(path => {
+          const name = path.includes("/") ? path.slice(path.lastIndexOf("/") + 1) : path;
+          return {
+            path,
+            name,
+            lowerPath: path.toLowerCase(),
+            lowerName: name.toLowerCase(),
+          };
+        });
+        this._lastSearchKey = null;
+        this._cachedResults = null;
       } catch (err) {
         this.fileList = [];
+        this.fileEntries = [];
       } finally {
         cx.notify();
       }
@@ -657,6 +732,12 @@ export default class FilesSearch extends View {
     if (this.tab === "files" || !q || q.length < 2) {
       this.textResults = [];
       this.isSearchingText = false;
+      this._lastSearchKey = null;
+      this._cachedResults = null;
+      if (this.textSearchTask) {
+        this.textSearchTask.cancel();
+        this.textSearchTask = null;
+      }
       return;
     }
 
@@ -665,50 +746,67 @@ export default class FilesSearch extends View {
     const on = this.searchOn;
     this.isSearchingText = true;
 
-    cx.spawn(async cx => {
-      try {
-        // Run ripgrep or git grep for content search
-        let res = await exec(
-          "rg",
-          ["--vimgrep", "--no-heading", "--color=never", "--smart-case", "--max-count=35", "--max-columns=200", "--", q],
-          { cwd: root, on }
-        ).catch(() => null);
+    if (this.textSearchTask) {
+      this.textSearchTask.cancel();
+      this.textSearchTask = null;
+    }
 
-        if (!res || res.code !== 0) {
-          res = await exec("git", ["grep", "-nI", "-i", "-m", "35", "--", q], { cwd: root, on }).catch(() => null);
-        }
+    this.textSearchTask = cx.timer.after(160, cx => {
+      cx.spawn(async cx => {
+        try {
+          let res = await exec(
+            "rg",
+            [
+              "--vimgrep", "--no-heading", "--color=never", "--smart-case",
+              "--max-count=35", "--max-columns=200",
+              "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.cache",
+              "--glob", "!target", "--glob", "!build", "--glob", "!.next", "--glob", "!.venv",
+              "--", q
+            ],
+            { cwd: root, on }
+          ).catch(() => null);
 
-        if (seq !== this.searchSeq) return;
+          if (!res || res.code !== 0) {
+            res = await exec("git", ["grep", "-nI", "-i", "-m", "35", "--", q], { cwd: root, on }).catch(() => null);
+          }
 
-        const results = [];
-        if (res && res.stdout) {
-          const lines = res.stdout.split("\n");
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            // Format: path:line:col:text or path:line:text
-            const m = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
-            if (m) {
-              results.push({
-                kind: "text",
-                path: m[1].replace(/^\.\//, ""),
-                line: parseInt(m[2], 10),
-                content: m[4].trim(),
-                matchedQuery: q,
-              });
+          if (seq !== this.searchSeq) return;
+
+          const results = [];
+          if (res && res.stdout) {
+            const lines = res.stdout.split("\n");
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              const m = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
+              if (m) {
+                results.push({
+                  kind: "text",
+                  path: m[1].replace(/^\.\//, ""),
+                  line: parseInt(m[2], 10),
+                  content: m[4].trim(),
+                  matchedQuery: q,
+                });
+              }
+              if (results.length >= 35) break;
             }
-            if (results.length >= 35) break;
+          }
+
+          this.textResults = results;
+          this._lastSearchKey = null;
+          this._cachedResults = null;
+        } catch {
+          if (seq === this.searchSeq) {
+            this.textResults = [];
+            this._lastSearchKey = null;
+            this._cachedResults = null;
+          }
+        } finally {
+          if (seq === this.searchSeq) {
+            this.isSearchingText = false;
+            cx.notify();
           }
         }
-
-        this.textResults = results;
-      } catch {
-        if (seq === this.searchSeq) this.textResults = [];
-      } finally {
-        if (seq === this.searchSeq) {
-          this.isSearchingText = false;
-          cx.notify();
-        }
-      }
+      });
     });
   }
 
@@ -716,12 +814,14 @@ export default class FilesSearch extends View {
     this.tab = tab;
     this.at = 0;
     this.scroll = 0;
+    this._lastSearchKey = null;
+    this._cachedResults = null;
     if (tab === "text" || tab === "all") {
       this.triggerTextSearch(cx);
     }
     if (this.showPreview) {
       const items = this.searchResults();
-      this.updatePreview(items[0], cx);
+      this.updatePreview(items[0], cx, true);
     }
     cx.notify();
   }
@@ -736,32 +836,83 @@ export default class FilesSearch extends View {
   // Returns array of items: { kind: 'file'|'text', path, name, hits, score, line?, content?, matchedQuery? }
   searchResults() {
     const rawQ = this.query.trim().toLowerCase();
+    const cacheKey = `${this.tab}:${rawQ}:${this.textResults.length}`;
+    if (this._lastSearchKey === cacheKey && this._cachedResults) {
+      return this._cachedResults;
+    }
+
     const q = rawQ.replace(/\s+/g, "");
 
     // 1. Matched files
     let matchedFiles = [];
     if (this.tab === "all" || this.tab === "files") {
+      const entries = this.fileEntries && this.fileEntries.length ? this.fileEntries : this.fileList.map(path => {
+        const name = path.includes("/") ? path.slice(path.lastIndexOf("/") + 1) : path;
+        return { path, name, lowerPath: path.toLowerCase(), lowerName: name.toLowerCase() };
+      });
+
       if (!rawQ) {
-        matchedFiles = this.fileList.slice(0, 30).map(path => {
-          const name = path.split("/").pop() || path;
-          return { kind: "file", path, name, score: 0, hits: [] };
-        });
+        matchedFiles = entries.slice(0, 30).map(e => ({
+          kind: "file",
+          path: e.path,
+          name: e.name,
+          score: 0,
+          hits: [],
+        }));
       } else {
+        const qLen = q.length;
+        const hasSlash = q.includes("/");
         const scored = [];
-        for (const path of this.fileList) {
-          const name = path.split("/").pop() || path;
-          const matchName = fuzzy(q, name);
-          const matchPath = fuzzy(q, path);
-          const best = matchName ?? matchPath;
-          if (best) {
+
+        for (let i = 0; i < entries.length; i++) {
+          const entry = entries[i];
+          const targetStr = hasSlash ? entry.lowerPath : entry.lowerName;
+          let at = 0;
+          let match = true;
+          for (let j = 0; j < qLen; j++) {
+            at = targetStr.indexOf(q[j], at);
+            if (at === -1) {
+              match = false;
+              break;
+            }
+            at++;
+          }
+          if (!match && !hasSlash) {
+            at = 0;
+            match = true;
+            for (let j = 0; j < qLen; j++) {
+              at = entry.lowerPath.indexOf(q[j], at);
+              if (at === -1) {
+                match = false;
+                break;
+              }
+              at++;
+            }
+          }
+          if (!match) continue;
+
+          const matchName = fuzzy(q, entry.name);
+          if (matchName) {
             scored.push({
               kind: "file",
-              path,
-              name,
-              score: best.score + (matchName ? 10 : 0),
-              hits: matchName ? matchName.hits : [],
+              path: entry.path,
+              name: entry.name,
+              score: matchName.score + 15,
+              hits: matchName.hits,
             });
+          } else {
+            const matchPath = fuzzy(q, entry.path);
+            if (matchPath) {
+              scored.push({
+                kind: "file",
+                path: entry.path,
+                name: entry.name,
+                score: matchPath.score,
+                hits: [],
+              });
+            }
           }
+          if (scored.length >= 250 && qLen <= 2) break;
         }
         scored.sort((a, b) => b.score - a.score);
         matchedFiles = scored.slice(0, 50);
@@ -771,11 +922,14 @@ export default class FilesSearch extends View {
     // 2. Matched text
     const textItems = (this.tab === "all" || this.tab === "text") ? this.textResults : [];
 
-    if (this.tab === "files") return matchedFiles;
-    if (this.tab === "text") return textItems;
+    let out;
+    if (this.tab === "files") out = matchedFiles;
+    else if (this.tab === "text") out = textItems;
+    else out = [...matchedFiles.slice(0, 25), ...textItems.slice(0, 25)];
 
-    // "All": top files, then top text results
-    return [...matchedFiles.slice(0, 25), ...textItems.slice(0, 25)];
+    this._lastSearchKey = cacheKey;
+    this._cachedResults = out;
+    return out;
   }
 
   renderHighlightedTitle(t, text, hits, isSelected) {
@@ -1085,7 +1239,16 @@ export default class FilesSearch extends View {
             el.child(
               this.previewEditorState
                 ? Editor.new(this.previewEditorState).flex_1().min_h(0)
-                : div().p(20).text_center().text_size(12).text_color(t.dim).child(visibleLines.length === 0 ? "Empty file" : "Loading preview…")
+                : v_flex()
+                    .flex_1()
+                    .min_h(0)
+                    .py(4)
+                    .on_scroll_wheel((e, cx) => {
+                      const delta = e.delta.y > 0 ? -3 : 3;
+                      this.previewScroll = Math.max(0, Math.min(maxScroll, this.previewScroll + delta));
+                      cx.notify();
+                    })
+                    .children(visibleLines.length > 0 ? visibleLines : [div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file")])
             )
           )
           .when(!this.previewLoading && !this.previewError && Boolean(targetLine), el =>
@@ -1108,7 +1271,7 @@ export default class FilesSearch extends View {
     const currentItem = results[this.at];
     if (this.showPreview && currentItem) {
       if (!this.previewItem || this.previewItem.path !== currentItem.path || this.previewItem.line !== currentItem.line) {
-        this.updatePreview(currentItem, cx);
+        this.updatePreview(currentItem, cx, false);
       }
     }
 
@@ -1176,7 +1339,7 @@ export default class FilesSearch extends View {
           .on_click((_e, cx) => {
             if (this.showPreview && i !== this.at) {
               this.at = i;
-              this.updatePreview(item, cx);
+              this.updatePreview(item, cx, true);
               cx.notify();
             } else {
               this.selectResult(item, cx);
@@ -1243,20 +1406,20 @@ export default class FilesSearch extends View {
         }
         if (k === "down") {
           this.at = Math.min(this.at + 1, results.length - 1);
-          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx, false);
         } else if (k === "up") {
           this.at = Math.max(this.at - 1, 0);
-          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx, false);
         } else if (k === "pagedown") {
           this.at = Math.min(this.at + SHOWN, results.length - 1);
-          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx, false);
         } else if (k === "pageup") {
           this.at = Math.max(this.at - SHOWN, 0);
-          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx, false);
         } else if ((e.alt && k === "p") || (e.control && k === "p")) {
           this.showPreview = !this.showPreview;
           setShared("files-search.preview", this.showPreview);
-          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+          if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx, true);
         } else if ((e.control || e.alt) && (k === "=" || k === "+")) {
           this.adjustWindowSize(120, 50, cx);
           cx.stop_propagation();
@@ -1357,7 +1520,7 @@ export default class FilesSearch extends View {
                 this.showPreview = !this.showPreview;
                 setShared("files-search.preview", this.showPreview);
                 if (this.showPreview && results[this.at]) {
-                  this.updatePreview(results[this.at], cx);
+                  this.updatePreview(results[this.at], cx, true);
                 }
                 cx.notify();
               })
@@ -1436,7 +1599,7 @@ export default class FilesSearch extends View {
                         this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, this.maxScroll));
                         while (this.at < results.length - 1 && this.at * ROW_H < this.scroll) this.at++;
                         while (this.at > 0 && (this.at + 1) * ROW_H > this.scroll + listH) this.at--;
-                        if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx);
+                        if (this.showPreview && results[this.at]) this.updatePreview(results[this.at], cx, false);
                         cx.notify();
                       })
                       .children(fixed ? list : [v_flex().children(list)])
